@@ -136,9 +136,25 @@ class QMavlinkWorker(QThread):
             "connection_str": self.connection_str, "timestamp": time.time(),
         }
 
+        last_gcs_heartbeat_send = 0.0
+
         while self._running:
             try:
+                now = time.time()
+                # Emit GCS heartbeat every 1.0s to satisfy PX4 / ArduPilot GCS connection preflight check
+                if now - last_gcs_heartbeat_send >= 1.0:
+                    last_gcs_heartbeat_send = now
+                    try:
+                        self._mav.mav.heartbeat_send(
+                            mavutil.mavlink.MAV_TYPE_GCS,
+                            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                            0, 0, 0
+                        )
+                    except Exception:
+                        pass
+
                 msg = self._mav.recv_match(blocking=True, timeout=0.2)
+
                 now = time.time()
 
                 if msg is not None:
