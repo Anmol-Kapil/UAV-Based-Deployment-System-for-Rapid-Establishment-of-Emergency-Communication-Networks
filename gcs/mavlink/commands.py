@@ -38,28 +38,17 @@ def _set_px4_circuit_breakers(mav):
         sys_id = getattr(mav, "target_system", 1) or 1
         comp_id = getattr(mav, "target_component", 1) or 1
         
-        # INT32 circuit breakers packed as 4-byte IEEE 754 floats
+        # Valid INT32 circuit breakers for Multicopter SITL
         params_int = {
             "CBRK_SUPPLY_CHK": 894281,  # Bypass battery / power supply check
             "CBRK_USB_CHK": 197848,     # Bypass USB connection check
             "CBRK_IO_SAFETY": 22027,    # Bypass hardware safety button
-            "CBRK_AIRSPD_CHK": 162128,  # Bypass airspeed check
-            "CBRK_ENGINEPROC": 284953,  # Bypass engine failure check
-            "CBRK_FLIGHTTERM": 121212,  # Bypass flight termination check
-            "CBRK_VTOLARMING": 15987,   # Bypass VTOL arming check
             "COM_RC_IN_MODE": 1,        # Joystick mode (disables RC transmitter requirement)
             "NAV_RCL_ACT": 0,           # Disable RC Loss failsafe
             "NAV_DLL_ACT": 0,           # Disable DataLink Loss failsafe
-            "COM_RCL_EXCEPT": 7,        # Ignore RC loss in Mission(1) + Hold(2) + Offboard(4)
+            "COM_RCL_EXCEPT": 7,        # Ignore RC/link loss in Mission(1) + Hold(2) + Offboard(4)
             "COM_ARM_WO_GPS": 1,        # Allow arming without 3D GPS fix
             "COM_ARM_MAG_STR": 0,       # Disable magnetic anomaly lock
-            "COM_ARM_EKF_POS": 0,       # Bypass EKF horizontal position lock
-            "COM_ARM_EKF_VEL": 0,       # Bypass EKF velocity lock
-            "COM_ARM_EKF_HGT": 0,       # Bypass EKF height lock
-            "COM_ARM_EKF_YAW": 0,       # Bypass EKF yaw lock
-            "COM_ARM_MIS_REQ": 0,       # Do not require mission to arm
-            "COM_ARM_AUTH_REQ": 0,      # Do not require arm authorization
-            "COM_PREARM_MODE": 0,       # Disable restrictive pre-arm checks
         }
         for name, val in params_int.items():
             packed_float = struct.unpack('<f', struct.pack('<i', int(val)))[0]
@@ -70,17 +59,29 @@ def _set_px4_circuit_breakers(mav):
                 mavutil.mavlink.MAV_PARAM_TYPE_INT32
             )
 
-        # REAL32 parameters: disable auto-disarm timers
+        # REAL32 parameters: disable auto-disarm timers (-1.0 disables in PX4)
         mav.mav.param_set_send(
             sys_id, comp_id,
-            b"COM_DISARM_PREROL",
-            0.0,
+            b"COM_DISARM_PRFLT",
+            -1.0,
             mavutil.mavlink.MAV_PARAM_TYPE_REAL32
         )
         mav.mav.param_set_send(
             sys_id, comp_id,
             b"COM_DISARM_LAND",
-            0.0,
+            -1.0,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+        mav.mav.param_set_send(
+            sys_id, comp_id,
+            b"COM_DL_LOSS_T",
+            120.0,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+        mav.mav.param_set_send(
+            sys_id, comp_id,
+            b"MIS_TAKEOFF_ALT",
+            5.0,
             mavutil.mavlink.MAV_PARAM_TYPE_REAL32
         )
 
@@ -141,9 +142,14 @@ def send_takeoff(mav, altitude: float = 5.0, lat: float = None, lon: float = Non
         sys_id = getattr(mav, "target_system", 1) or 1
         comp_id = getattr(mav, "target_component", 1) or 1
 
-        # Use current lat/lon if provided, else NaN per MAVLink specification
-        target_lat = float(lat) if (lat is not None and lat != 0.0) else float('nan')
-        target_lon = float(lon) if (lon is not None and lon != 0.0) else float('nan')
+        # Set MIS_TAKEOFF_ALT parameter to target altitude
+        mav.mav.param_set_send(
+            sys_id, comp_id,
+            b"MIS_TAKEOFF_ALT",
+            float(altitude),
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+        time.sleep(0.05)
 
         # 1. Arm vehicle first (force arm bypass 21196.0)
         mav.mav.command_long_send(
@@ -153,22 +159,31 @@ def send_takeoff(mav, altitude: float = 5.0, lat: float = None, lon: float = Non
         )
         time.sleep(0.15)
 
-        # 2. Send MAV_CMD_NAV_TAKEOFF with target altitude
+        # 2. Send MAV_CMD_NAV_TAKEOFF via COMMAND_INT (explicit relative altitude)
+        try:
+            mav.mav.command_int_send(
+                sys_id, comp_id,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                0, 0,
+                0, 0, 0, float('nan'),
+                0, 0,
+                float(altitude)
+            )
+        except Exception:
+            pass
+
+        # 3. Also send standard MAV_CMD_NAV_TAKEOFF via COMMAND_LONG
+        target_lat = float(lat) if (lat is not None and lat != 0.0) else float('nan')
+        target_lon = float(lon) if (lon is not None and lon != 0.0) else float('nan')
         mav.mav.command_long_send(
             sys_id, comp_id,
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
             0,
-            0,             # param1: pitch
-            0, 0,          # param2, param3: empty
-            float('nan'),  # param4: yaw
-            target_lat,    # param5: latitude
-            target_lon,    # param6: longitude
-            float(altitude) # param7: altitude
+            0, 0, 0, float('nan'),
+            target_lat, target_lon,
+            float(altitude)
         )
-        time.sleep(0.1)
-
-        # 3. Set TAKEOFF mode
-        _send_set_mode(mav, "TAKEOFF")
         return f"TAKEOFF COMMAND SENT — TARGET ALT: {altitude:.1f} m"
     except Exception as e:
         return f"TAKEOFF FAILED: {str(e)}"
@@ -299,6 +314,9 @@ def _send_set_mode(mav, mode_str: str) -> str:
             "STABILIZE": (1, 0),
             "GUIDED": (4, 4),
         }
+
+        if mode_upper == "TAKEOFF":
+            return "TAKEOFF MODE ACTIVE (PX4)"
 
         if mode_upper in px4_modes:
             main_m, sub_m = px4_modes[mode_upper]

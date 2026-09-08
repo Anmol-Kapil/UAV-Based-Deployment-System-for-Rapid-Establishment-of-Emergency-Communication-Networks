@@ -81,6 +81,26 @@ class QMavsdkWorker(QThread):
         self._compid = 1
         self._last_heartbeat_time = 0.0
         self._px4_configured = False
+        self._last_alt_abs = 0.0
+
+    def _start_gcs_heartbeat_loop(self):
+        """Dedicated high-priority 2 Hz heartbeat emitter to guarantee rock-solid GCS connection."""
+        def _beat():
+            while self._running:
+                if self._mav is not None and not self._mock_mode:
+                    try:
+                        self._mutex.lock()
+                        self._mav.mav.heartbeat_send(
+                            mavutil.mavlink.MAV_TYPE_GCS,
+                            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                            0, 0, 0
+                        )
+                        self._mutex.unlock()
+                    except Exception:
+                        self._mutex.unlock()
+                time.sleep(0.5)
+        import threading
+        threading.Thread(target=_beat, daemon=True, name="GCS-Heartbeat").start()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Thread Run Loop
@@ -94,9 +114,7 @@ class QMavsdkWorker(QThread):
 
         # Connect to live MAVLink stream (PX4 SITL Gazebo or hardware)
         try:
-            # pymavlink connection
             conn_target = self.normalized_address
-            # If udp:127.0.0.1:14550 or udpin:0.0.0.0:14550, handle bind gracefully
             self._mav = mavutil.mavlink_connection(
                 conn_target,
                 baud=self.baud,
@@ -106,6 +124,9 @@ class QMavsdkWorker(QThread):
             self.connection_error_signal.emit(f"Connection failed to {self.normalized_address}: {str(e)}")
             self._running = False
             return
+
+        # Start background 2 Hz GCS heartbeat immediately so PX4 never times out
+        self._start_gcs_heartbeat_loop()
 
         telemetry_cache: Dict[str, Any] = {
             "lat": 0.0, "lon": 0.0, "alt_rel": 0.0, "alt_abs": 0.0,
@@ -117,23 +138,9 @@ class QMavsdkWorker(QThread):
             "connection_str": self.connection_str, "timestamp": time.time(),
         }
 
-        last_gcs_heartbeat_send = 0.0
-
         while self._running:
             try:
                 now = time.time()
-
-                # Send 1 Hz GCS Heartbeat so PX4 knows an operator GCS is active
-                if now - last_gcs_heartbeat_send >= 1.0:
-                    last_gcs_heartbeat_send = now
-                    try:
-                        self._mav.mav.heartbeat_send(
-                            mavutil.mavlink.MAV_TYPE_GCS,
-                            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                            0, 0, 0
-                        )
-                    except Exception:
-                        pass
 
                 # Stream 10 Hz MANUAL_CONTROL (#69) message if manual control is active
                 if now - self._last_manual_send >= 0.1:
@@ -186,6 +193,7 @@ class QMavsdkWorker(QThread):
                             self._configure_px4_sitl()
 
                     elif msg_type == "GLOBAL_POSITION_INT":
+                        self._last_alt_abs = msg.alt / 1000.0
                         telemetry_cache.update({
                             "lat": msg.lat / 1e7, "lon": msg.lon / 1e7,
                             "alt_rel": msg.relative_alt / 1000.0, "alt_abs": msg.alt / 1000.0,
@@ -314,37 +322,27 @@ class QMavsdkWorker(QThread):
         def _do_config():
             try:
                 time.sleep(0.2)
-                # Comprehensive INT32 Circuit Breakers & Pre-Arm Overrides
-                # Packed as IEEE 754 float bytes so PX4's memcpy recovers the exact int32
+                # Valid INT32 Circuit Breakers & Pre-Arm Overrides for Multicopter SITL
                 params_int = {
                     "CBRK_SUPPLY_CHK": 894281,  # Bypass battery / power module check
                     "CBRK_USB_CHK": 197848,     # Bypass USB connection check
                     "CBRK_IO_SAFETY": 22027,    # Bypass hardware safety switch
-                    "CBRK_AIRSPD_CHK": 162128,  # Bypass airspeed sensor check
-                    "CBRK_ENGINEPROC": 284953,  # Bypass engine failure check
-                    "CBRK_FLIGHTTERM": 121212,  # Bypass flight termination check
-                    "CBRK_VTOLARMING": 15987,   # Bypass VTOL arming check
                     "COM_RC_IN_MODE": 1,        # Joystick mode (disables RC transmitter requirement & checks)
                     "NAV_RCL_ACT": 0,           # Disable RC Loss failsafe
                     "NAV_DLL_ACT": 0,           # Disable DataLink Loss failsafe
-                    "COM_RCL_EXCEPT": 7,        # Ignore RC loss in Mission(1) + Hold(2) + Offboard(4)
+                    "COM_RCL_EXCEPT": 7,        # Ignore RC/link loss in Mission(1) + Hold(2) + Offboard(4)
                     "COM_ARM_WO_GPS": 1,        # Allow arming without 3D GPS fix
                     "COM_ARM_MAG_STR": 0,       # Disable magnetic anomaly lock
-                    "COM_ARM_EKF_POS": 0,       # Bypass EKF horizontal position lock
-                    "COM_ARM_EKF_VEL": 0,       # Bypass EKF velocity lock
-                    "COM_ARM_EKF_HGT": 0,       # Bypass EKF height lock
-                    "COM_ARM_EKF_YAW": 0,       # Bypass EKF yaw lock
-                    "COM_ARM_MIS_REQ": 0,       # Do not require mission to arm
-                    "COM_ARM_AUTH_REQ": 0,      # Do not require arm authorization
-                    "COM_PREARM_MODE": 0,       # Disable restrictive pre-arm checks
                 }
                 for name, val in params_int.items():
                     self._set_param_int(name, val)
                     time.sleep(0.02)
 
-                # Float parameters: disable auto-disarm timers
-                self._set_param_float("COM_DISARM_PREROL", 0.0)
-                self._set_param_float("COM_DISARM_LAND", 0.0)
+                # Float parameters: disable auto-disarm timers (-1.0 disables in PX4)
+                self._set_param_float("COM_DISARM_PRFLT", -1.0)  # Real PX4 parameter! Disables ground auto-disarm
+                self._set_param_float("COM_DISARM_LAND", -1.0)   # Disables landing auto-disarm
+                self._set_param_float("COM_DL_LOSS_T", 120.0)    # Extends GCS connection loss timeout
+                self._set_param_float("MIS_TAKEOFF_ALT", 5.0)    # Default takeoff altitude
                 time.sleep(0.05)
 
                 # Disengage safety switch via MAVLink command (SAFETY_SWITCH_STATE_DANGEROUS = 1)
@@ -363,7 +361,7 @@ class QMavsdkWorker(QThread):
                     self._sysid, self._compid,
                     mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
                 )
-                app_state.log("INFO", "PX4", "Bypassed all SITL health checks (CBRK_SUPPLY_CHK, CBRK_USB_CHK, CBRK_IO_SAFETY, COM_RC_IN_MODE, COM_ARM_WO_GPS, COM_DISARM_PREROL).")
+                app_state.log("INFO", "PX4", "Configured PX4 SITL bypasses (CBRK_SUPPLY_CHK, CBRK_USB_CHK, CBRK_IO_SAFETY, COM_RC_IN_MODE, COM_ARM_WO_GPS, COM_DISARM_PRFLT=-1).")
             except Exception as e:
                 app_state.log("DEBUG", "PX4", f"SITL config note: {e}")
         import threading
@@ -383,14 +381,14 @@ class QMavsdkWorker(QThread):
             return
         def _do_arm():
             try:
-                # 1. Re-assert key circuit breakers immediately before arming
+                # 1. Re-assert key circuit breakers and disable auto-disarm
                 self._set_param_int("CBRK_SUPPLY_CHK", 894281)
                 self._set_param_int("CBRK_USB_CHK", 197848)
                 self._set_param_int("CBRK_IO_SAFETY", 22027)
                 self._set_param_int("COM_RC_IN_MODE", 1)
                 self._set_param_int("COM_ARM_WO_GPS", 1)
-                self._set_param_float("COM_DISARM_PREROL", 0.0)
-                time.sleep(0.05)
+                self._set_param_float("COM_DISARM_PRFLT", -1.0)
+                time.sleep(0.04)
 
                 # Disengage safety switch
                 try:
@@ -402,7 +400,7 @@ class QMavsdkWorker(QThread):
                     )
                 except Exception:
                     pass
-                time.sleep(0.05)
+                time.sleep(0.04)
 
                 self._mutex.lock()
                 # 2. Send MAV_CMD_COMPONENT_ARM_DISARM with force=21196.0 (bypass preflight checks)
@@ -460,13 +458,14 @@ class QMavsdkWorker(QThread):
 
         def _do_takeoff():
             try:
-                # 0. Re-assert circuit breakers immediately before takeoff
+                # 0. Re-assert circuit breakers and disable auto-disarm
                 self._set_param_int("CBRK_SUPPLY_CHK", 894281)
                 self._set_param_int("CBRK_USB_CHK", 197848)
                 self._set_param_int("CBRK_IO_SAFETY", 22027)
                 self._set_param_int("COM_RC_IN_MODE", 1)
                 self._set_param_int("COM_ARM_WO_GPS", 1)
-                self._set_param_float("COM_DISARM_PREROL", 0.0)
+                self._set_param_float("COM_DISARM_PRFLT", -1.0)
+                self._set_param_float("MIS_TAKEOFF_ALT", float(altitude))
                 try:
                     self._mav.mav.command_long_send(
                         self._sysid, self._compid,
@@ -478,7 +477,7 @@ class QMavsdkWorker(QThread):
                     pass
                 time.sleep(0.05)
 
-                # 1. Arm vehicle
+                # 1. Arm vehicle (param2 = 21196.0 force arm bypass)
                 self._mutex.lock()
                 self._mav.mav.command_long_send(
                     self._sysid, self._compid,
@@ -488,32 +487,31 @@ class QMavsdkWorker(QThread):
                 self._mutex.unlock()
                 time.sleep(0.15)
 
-                # 2. Send MAV_CMD_NAV_TAKEOFF with altitude
-                self._mutex.lock()
-                self._mav.mav.command_long_send(
-                    self._sysid, self._compid,
-                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                    0,
-                    0, 0, 0, float('nan'), float('nan'), float('nan'), float(altitude)
-                )
-                self._mutex.unlock()
-                time.sleep(0.1)
+                # 2. Calculate target AMSL altitude (vital for SITL worlds where ground AMSL > 0)
+                target_amsl = (self._last_alt_abs + altitude) if self._last_alt_abs > 0.5 else float(altitude)
 
-                # 3. Switch to PX4 AUTO_TAKEOFF mode (custom_mode = (4 << 16) | (2 << 24) = 33816576)
+                # 3. Send MAV_CMD_NAV_TAKEOFF via COMMAND_INT (explicitly relative to ground)
                 self._mutex.lock()
                 try:
-                    self._mav.mav.set_mode_send(
-                        self._sysid,
-                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                        33816576
+                    self._mav.mav.command_int_send(
+                        self._sysid, self._compid,
+                        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                        0, 0,
+                        0, 0, 0, float('nan'),
+                        0, 0,
+                        float(altitude)
                     )
                 except Exception:
                     pass
+
+                # 4. Also send MAV_CMD_NAV_TAKEOFF via COMMAND_LONG with AMSL target altitude
                 try:
                     self._mav.mav.command_long_send(
                         self._sysid, self._compid,
-                        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-                        0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 2, 0, 0, 0, 0
+                        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                        0,
+                        0, 0, 0, float('nan'), float('nan'), float('nan'), float(target_amsl)
                     )
                 except Exception:
                     pass
