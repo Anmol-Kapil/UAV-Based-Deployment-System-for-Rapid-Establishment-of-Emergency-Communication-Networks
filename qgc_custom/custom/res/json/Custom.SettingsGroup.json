@@ -1,0 +1,80 @@
+[
+    {
+        "name":             "deployPayloadServo",
+        "shortDescription": "Payload Servo Channel",
+        "type":             "int32",
+        "default":          9,
+        "min":              1,
+        "max":              16,
+        "units":            "",
+        "decimalPlaces":    0,
+        "reboot":           false
+    },
+    {
+        "name":             "deployPayloadPwmOpen",
+        "shortDescription": "Payload Release PWM",
+        "type":             "int32",
+        "default":          1900,
+        "min":              1000,
+        "max":              2000,
+        "units":            "us",
+        "decimalPlaces":    0,
+        "reboot":           false
+    },
+    {
+        "name":             "deployPayloadPwmClose",
+        "shortDescription": "Payload Close PWM",
+        "type":             "int32",
+        "default":          1100,
+        "min":              1000,
+        "max":              2000,
+        "units":            "us",
+        "decimalPlaces":    0,
+        "reboot":           false
+    },
+    {
+        "name":             "totalRelayNodes",
+        "shortDescription": "Total Relay Nodes",
+        "longDescription":  "Total number of relay/mesh nodes planned for this mission.",
+        "type":             "int32",
+        "default":          6,
+        "min":              1,
+        "max":              20,
+        "units":            "",
+        "decimalPlaces":    0,
+        "reboot":           false
+    },
+    {
+        "name":             "rfFrequencyBand",
+        "shortDescription": "RF Frequency Band",
+        "type":             "string",
+        "default":          "2.4 GHz",
+        "reboot":           false
+    },
+    {
+        "name":             "rfSurveyDuration",
+        "shortDescription": "RF Survey Dwell Time",
+        "type":             "double",
+        "default":          5.0,
+        "min":              1.0,
+        "max":              60.0,
+        "units":            "s",
+        "decimalPlaces":    1,
+        "reboot":           false
+    },
+    {
+        "name":             "operatorCallsign",
+        "shortDescription": "Operator Callsign",
+        "longDescription":  "Field operator''s radio callsign or identifier for mission logs.",
+        "type":             "string",
+        "default":          "ALPHA-1",
+        "reboot":           false
+    },
+    {
+        "name":             "showAttitudeWidget",
+        "shortDescription": "Show Attitude Overlay",
+        "type":             "bool",
+        "default":          true,
+        "reboot":           false
+    }
+]

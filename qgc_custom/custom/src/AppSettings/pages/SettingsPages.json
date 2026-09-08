@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "fileType": "SettingsPages",
+    "comment": "UAV Emergency GCS settings page injected after General settings.",
+    "pages": [
+        {
+            "name": "Emergency GCS",
+            "qml": "CustomSettings.qml",
+            "icon": "qrc:/res/gear-white.svg",
+            "pageDefinition": "Custom.SettingsUI.json",
+            "insertAfter": "General"
+        }
+    ]
+}

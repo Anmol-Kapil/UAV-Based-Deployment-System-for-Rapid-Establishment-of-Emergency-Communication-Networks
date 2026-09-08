@@ -1,0 +1,29 @@
+{
+    "version": 1,
+    "fileType": "SettingsUI",
+    "groups": [
+        {
+            "heading": "Emergency Deployment",
+            "controls": [
+                { "setting": "customSettings.totalRelayNodes" },
+                { "setting": "customSettings.deployPayloadServo" },
+                { "setting": "customSettings.deployPayloadPwmOpen" },
+                { "setting": "customSettings.deployPayloadPwmClose" }
+            ]
+        },
+        {
+            "heading": "RF Survey",
+            "controls": [
+                { "setting": "customSettings.rfFrequencyBand" },
+                { "setting": "customSettings.rfSurveyDuration" }
+            ]
+        },
+        {
+            "heading": "Operator",
+            "controls": [
+                { "setting": "customSettings.operatorCallsign" },
+                { "setting": "customSettings.showAttitudeWidget" }
+            ]
+        }
+    ]
+}
