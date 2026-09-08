@@ -1,0 +1,1722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GCS Tactical Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" 
+        onerror="this.onerror=null; window.leafletFailed=true;" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body, html { width: 100%; height: 100%; overflow: hidden; background: #0b0f14; font-family: 'Segoe UI', Inter, sans-serif; color: #c9d1d9; }
+    #map { width: 100%; height: 100%; background: #080c10; }
+
+    /* Offline Tactical Canvas Grid */
+    #fallbackCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: none;
+      z-index: 1;
+    }
+
+    /* Map Overlay Layer Controls */
+    .map-overlay-layers {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(22, 27, 34, 0.92);
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 11px;
+      z-index: 1000;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      backdrop-filter: blur(4px);
+      min-width: 170px;
+    }
+
+    .layer-title {
+      font-weight: 700;
+      font-size: 10px;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+      border-bottom: 1px solid #30363d;
+      padding-bottom: 4px;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .layer-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 5px;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .layer-item input[type="checkbox"] {
+      accent-color: #58a6ff;
+      cursor: pointer;
+    }
+
+    .layer-item span {
+      color: #c9d1d9;
+    }
+
+    /* Coordinate Hud */
+    .coord-hud {
+      position: absolute;
+      bottom: 8px;
+      left: 12px;
+      background: rgba(13, 17, 23, 0.85);
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-family: 'Consolas', monospace;
+      font-size: 11px;
+      color: #79c0ff;
+      z-index: 1000;
+      pointer-events: none;
+    }
+
+    /* Top Info Pill */
+    .map-status-pill {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(22, 27, 34, 0.92);
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #58a6ff;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      background-color: #3fb950;
+      border-radius: 50%;
+      box-shadow: 0 0 6px #3fb950;
+    }
+
+    /* Rotatable Custom UAV Marker Icon */
+    .uav-marker-icon {
+      transition: transform 0.15s ease-out;
+      transform-origin: center center;
+    }
+
+    /* Waypoint Marker Badges */
+    .wp-marker {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #161b22;
+      border: 2px solid #d29922;
+      color: #f0f6fc;
+      border-radius: 50%;
+      font-family: 'Consolas', monospace;
+      font-weight: bold;
+      font-size: 11px;
+      box-shadow: 0 0 6px rgba(210, 153, 34, 0.6);
+      transition: all 0.2s ease;
+    }
+
+    .wp-marker.active {
+      background: #238636;
+      border-color: #3fb950;
+      box-shadow: 0 0 12px #3fb950;
+      animation: wp-pulse 1.5s infinite alternate;
+    }
+
+    @keyframes wp-pulse {
+      0% { transform: scale(1); box-shadow: 0 0 8px #3fb950; }
+      100% { transform: scale(1.15); box-shadow: 0 0 16px #3fb950; }
+    }
+
+    /* Click mode crosshair */
+    #map.crosshair-cursor {
+      cursor: crosshair !important;
+    }
+
+    /* Tactical Target Crosshair Marker */
+    .target-marker {
+      width: 26px;
+      height: 26px;
+      border: 2px solid #f78166;
+      border-radius: 50%;
+      position: relative;
+      background: rgba(247, 129, 102, 0.25);
+      box-shadow: 0 0 10px #f78166;
+      animation: target-pulse 1.8s infinite alternate;
+    }
+    .target-marker::before, .target-marker::after {
+      content: '';
+      position: absolute;
+      background: #f78166;
+    }
+    .target-marker::before {
+      top: 50%; left: -6px; right: -6px; height: 2px; transform: translateY(-50%);
+    }
+    .target-marker::after {
+      left: 50%; top: -6px; bottom: -6px; width: 2px; transform: translateX(-50%);
+    }
+
+    @keyframes target-pulse {
+      0% { transform: scale(1); box-shadow: 0 0 6px #f78166; }
+      100% { transform: scale(1.15); box-shadow: 0 0 14px #f78166; }
+    }
+
+    /* Emergency Communication Relay Node Marker */
+    .node-marker {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0d1117;
+      border: 2px solid #3fb950;
+      color: #3fb950;
+      border-radius: 4px;
+      font-family: 'Consolas', monospace;
+      font-weight: bold;
+      font-size: 10px;
+      box-shadow: 0 0 8px rgba(63, 185, 80, 0.7);
+      padding: 2px 5px;
+      white-space: nowrap;
+    }
+
+    /* Disaster Area Vertex Badge */
+    .vertex-marker {
+      background: #d29922;
+      color: #ffffff;
+      border: 2px solid #ffffff;
+      border-radius: 50%;
+      width: 22px;
+      height: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 10px;
+      box-shadow: 0 0 8px rgba(210, 153, 34, 0.8);
+    }
+
+    /* Disaster Area Centroid Badge */
+    .area-centroid-badge {
+      background: rgba(22, 27, 34, 0.94);
+      border: 1.5px solid #d29922;
+      border-radius: 4px;
+      padding: 3px 8px;
+      color: #e3b341;
+      font-family: 'Consolas', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      white-space: nowrap;
+      text-align: center;
+      box-shadow: 0 0 10px rgba(0, 0, 0, 0.7);
+    }
+
+    /* Hazard Zone Warning Marker */
+    .hazard-marker {
+      background: rgba(218, 54, 51, 0.92);
+      border: 1.5px solid #f85149;
+      border-radius: 4px;
+      padding: 2px 6px;
+      color: #ffffff;
+      font-family: 'Consolas', monospace;
+      font-size: 9px;
+      font-weight: 700;
+      white-space: nowrap;
+      box-shadow: 0 0 8px rgba(248, 81, 73, 0.6);
+    }
+
+    /* Candidate Drop Site Marker */
+    .candidate-marker {
+      background: rgba(56, 139, 253, 0.5);
+      border: 1.5px solid #58a6ff;
+      border-radius: 50%;
+      width: 12px;
+      height: 12px;
+      cursor: pointer;
+      transition: transform 0.15s ease, background 0.15s;
+    }
+    .candidate-marker:hover {
+      background: #58a6ff;
+      transform: scale(1.4);
+      box-shadow: 0 0 10px #58a6ff;
+    }
+
+    /* Selected Candidate Badge */
+    .selected-candidate-badge {
+      background: #1f6feb;
+      border: 2px solid #ffffff;
+      border-radius: 50%;
+      color: #ffffff;
+      font-family: 'Segoe UI', Inter, sans-serif;
+      font-size: 10px;
+      font-weight: 800;
+      text-align: center;
+      line-height: 22px;
+      box-shadow: 0 0 14px rgba(56, 139, 253, 0.9), inset 0 0 4px rgba(255, 255, 255, 0.6);
+      cursor: pointer;
+    }
+
+    /* Mode Banner Overlay */
+    .click-mode-banner {
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(187, 128, 9, 0.95);
+      border: 1px solid #d29922;
+      border-radius: 4px;
+      padding: 6px 16px;
+      font-size: 11px;
+      font-weight: bold;
+      color: #ffffff;
+      z-index: 1000;
+      letter-spacing: 0.5px;
+      box-shadow: 0 0 12px rgba(210, 153, 34, 0.5);
+      pointer-events: none;
+    }
+
+    /* Phase 13: Floating RSSI Heatmap Legend */
+    .heatmap-legend {
+      position: absolute;
+      bottom: 36px;
+      right: 12px;
+      background: rgba(13, 17, 23, 0.92);
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 10px;
+      color: #c9d1d9;
+      z-index: 1000;
+      backdrop-filter: blur(4px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+      display: none;
+      min-width: 140px;
+    }
+    .heatmap-legend-title {
+      font-size: 10px;
+      font-weight: 700;
+      color: #58a6ff;
+      margin-bottom: 6px;
+      letter-spacing: 0.5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid #21262d;
+      padding-bottom: 4px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      margin-bottom: 3px;
+      font-size: 9px;
+      font-family: Consolas, monospace;
+    }
+    .legend-color-box {
+      width: 14px;
+      height: 10px;
+      border-radius: 2px;
+      margin-right: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <canvas id="fallbackCanvas"></canvas>
+
+  <div id="clickModeBanner" class="click-mode-banner" style="display: none;">
+    [CLICK MAP TO ADD WAYPOINT]
+  </div>
+
+  <div class="map-status-pill">
+    <div class="status-dot"></div>
+    <span id="mapEngineStatus">TACTICAL MAP — PHASE 14 (GAP ANALYSIS ACTIVE)</span>
+  </div>
+
+  <div class="map-overlay-layers">
+    <div class="layer-title">
+      <span>Map Layers</span>
+      <span style="font-size: 9px; color: #3fb950;">PHASE 14</span>
+    </div>
+    <label class="layer-item"><input type="checkbox" id="layerUAV" checked /> <span>UAV</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerTrack" checked /> <span>Flight Track</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerMission" checked /> <span>Mission</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerArea" checked /> <span>Affected Area</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerCandidates" checked /> <span>Candidates</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerNodes" checked /> <span>Nodes</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerCoverage" checked /> <span>Coverage</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerRSSI" checked /> <span>RSSI Heatmap</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerSurvey" checked /> <span>Survey Path</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerGaps" checked /> <span>Gaps</span></label>
+    <label class="layer-item"><input type="checkbox" id="layerGeofence" /> <span>Geofence</span></label>
+  </div>
+
+  <!-- Heatmap Legend Card -->
+  <div class="heatmap-legend" id="heatmapLegend">
+    <div class="heatmap-legend-title">
+      <span>RF SIGNAL (RSSI)</span>
+      <span style="font-size: 8px; color: #3fb950;">IDW 2D</span>
+    </div>
+    <div class="legend-item"><div class="legend-color-box" style="background: #2ecc71;"></div><span>Strong (&ge; -65 dBm)</span></div>
+    <div class="legend-item"><div class="legend-color-box" style="background: #a3e635;"></div><span>Good (-75 to -65)</span></div>
+    <div class="legend-item"><div class="legend-color-box" style="background: #f39c12;"></div><span>Weak (-85 to -75)</span></div>
+    <div class="legend-item"><div class="legend-color-box" style="background: #e74c3c;"></div><span>No coverage (&lt; -85)</span></div>
+  </div>
+
+  <div class="coord-hud" id="coordHud">LAT: 37.774900 | LON: -122.419400 | ZOOM: 16</div>
+
+  <script>
+    let map = null;
+    let uavMarker = null;
+    let flightTrackPolyline = null;
+    let missionLayer = null;
+    let missionPolyline = null;
+    let targetLayer = null;
+    let nodesLayer = null;
+    let disasterLayer = null;
+    let hazardLayer = null;
+    let candidateLayer = null;
+    let coverageLayer = null;
+    let surveyLayer = null;
+    let heatmapLayer = null;
+    let gapLayer = null;
+    let fallbackSurveyPlan = null;
+    let fallbackSurveySamples = [];
+    let fallbackHeatmapData = null;
+    let fallbackGapData = null;
+    let currentWaypoints = [];
+    let activeWpSeq = 0;
+    let mapClickMode = 'NAV';
+    let trackPoints = [];
+    let isFollowMode = true;
+    let defaultCenter = [37.7749, -122.4194]; // Disaster area reference
+    let lastUAVPos = null;
+
+    const hud = document.getElementById('coordHud');
+
+    // Quadcopter SVG Icon string
+    function createUAVIconSvg(heading) {
+      const svg = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" style="transform: rotate(${heading}deg); transform-origin: 50% 50%;">
+          <!-- Rotors -->
+          <circle cx="8" cy="8" r="5" fill="none" stroke="#58a6ff" stroke-width="1.5" opacity="0.8"/>
+          <circle cx="28" cy="8" r="5" fill="none" stroke="#58a6ff" stroke-width="1.5" opacity="0.8"/>
+          <circle cx="8" cy="28" r="5" fill="none" stroke="#58a6ff" stroke-width="1.5" opacity="0.8"/>
+          <circle cx="28" cy="28" r="5" fill="none" stroke="#58a6ff" stroke-width="1.5" opacity="0.8"/>
+          <!-- Arms -->
+          <line x1="8" y1="8" x2="28" y2="28" stroke="#388bfd" stroke-width="2.5"/>
+          <line x1="28" y1="8" x2="8" y2="28" stroke="#388bfd" stroke-width="2.5"/>
+          <!-- Central Fuselage Body -->
+          <circle cx="18" cy="18" r="6" fill="#1f6feb" stroke="#ffffff" stroke-width="1.5"/>
+          <!-- Nose Heading Indicator Triangle -->
+          <polygon points="18,7 14,14 22,14" fill="#3fb950"/>
+        </svg>`;
+      return 'data:image/svg+xml;base64,' + btoa(svg);
+    }
+
+    function initLeaflet() {
+      if (typeof L === 'undefined' || window.leafletFailed) {
+        initFallbackGrid();
+        return;
+      }
+
+      try {
+        map = L.map('map', {
+          center: defaultCenter,
+          zoom: 16,
+          zoomControl: true,
+          attributionControl: false
+        });
+
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+          maxZoom: 19,
+          subdomains: 'abcd',
+          timeout: 4000
+        }).addTo(map).on('tileerror', function() {
+          console.warn("Tile loading fallback active");
+        });
+
+        // Initialize Flight Track Polyline
+        flightTrackPolyline = L.polyline([], {
+          color: '#58a6ff',
+          weight: 3.5,
+          opacity: 0.85,
+          dashArray: null
+        }).addTo(map);
+
+        // Initialize Tactical Layers
+        missionLayer = L.layerGroup().addTo(map);
+        targetLayer = L.layerGroup().addTo(map);
+        nodesLayer = L.layerGroup().addTo(map);
+        disasterLayer = L.layerGroup().addTo(map);
+        hazardLayer = L.layerGroup().addTo(map);
+        candidateLayer = L.layerGroup().addTo(map);
+        coverageLayer = L.layerGroup().addTo(map);
+        surveyLayer = L.layerGroup().addTo(map);
+        heatmapLayer = L.layerGroup().addTo(map);
+        gapLayer = L.layerGroup().addTo(map);
+
+        map.on('click', function(e) {
+          if (mapClickMode === 'ADD_WAYPOINT') {
+            document.title = "MAP_CLICK:" + e.latlng.lat.toFixed(7) + ":" + e.latlng.lng.toFixed(7);
+          } else if (mapClickMode === 'SET_DEPLOY_TARGET') {
+            document.title = "MAP_TARGET_CLICK:" + e.latlng.lat.toFixed(7) + ":" + e.latlng.lng.toFixed(7);
+          } else if (mapClickMode === 'DRAW_DISASTER_AREA') {
+            document.title = "MAP_AREA_CLICK:" + e.latlng.lat.toFixed(7) + ":" + e.latlng.lng.toFixed(7);
+          }
+        });
+
+        map.on('mousemove', function(e) {
+          hud.textContent = `LAT: ${e.latlng.lat.toFixed(6)} | LON: ${e.latlng.lng.toFixed(6)} | ZOOM: ${map.getZoom()}`;
+        });
+
+        map.on('zoomend', function() {
+          const center = map.getCenter();
+          hud.textContent = `LAT: ${center.lat.toFixed(6)} | LON: ${center.lng.toFixed(6)} | ZOOM: ${map.getZoom()}`;
+        });
+
+        // Reticle around home/disaster center
+        L.circle(defaultCenter, {
+          color: '#388bfd',
+          fillColor: '#1f6feb',
+          fillOpacity: 0.08,
+          radius: 150,
+          weight: 1,
+          dashArray: '4, 4'
+        }).addTo(map);
+
+        // Bind Layer Toggle Checkboxes
+        setupLayerToggles();
+
+      } catch (err) {
+        console.error("Leaflet init error:", err);
+        initFallbackGrid();
+      }
+    }
+
+    function setupLayerToggles() {
+      const chkUAV = document.getElementById('layerUAV');
+      const chkTrack = document.getElementById('layerTrack');
+      const chkMission = document.getElementById('layerMission');
+      const chkArea = document.getElementById('layerArea');
+      const chkNodes = document.getElementById('layerNodes');
+      const chkCandidates = document.getElementById('layerCandidates');
+      const chkCoverage = document.getElementById('layerCoverage');
+
+      if (chkUAV) {
+        chkUAV.addEventListener('change', (e) => {
+          if (uavMarker) {
+            if (e.target.checked) uavMarker.addTo(map);
+            else map.removeLayer(uavMarker);
+          }
+        });
+      }
+
+      if (chkTrack) {
+        chkTrack.addEventListener('change', (e) => {
+          if (flightTrackPolyline) {
+            if (e.target.checked) flightTrackPolyline.addTo(map);
+            else map.removeLayer(flightTrackPolyline);
+          }
+        });
+      }
+
+      if (chkMission) {
+        chkMission.addEventListener('change', (e) => {
+          if (missionLayer) {
+            if (e.target.checked) missionLayer.addTo(map);
+            else map.removeLayer(missionLayer);
+          }
+        });
+      }
+
+      if (chkArea) {
+        chkArea.addEventListener('change', (e) => {
+          if (disasterLayer) {
+            if (e.target.checked) disasterLayer.addTo(map);
+            else map.removeLayer(disasterLayer);
+          }
+        });
+      }
+
+      if (chkNodes) {
+        chkNodes.addEventListener('change', (e) => {
+          if (nodesLayer) {
+            if (e.target.checked) nodesLayer.addTo(map);
+            else map.removeLayer(nodesLayer);
+          }
+        });
+      }
+
+      if (chkCandidates) {
+        chkCandidates.addEventListener('change', (e) => {
+          if (candidateLayer) {
+            if (e.target.checked) candidateLayer.addTo(map);
+            else map.removeLayer(candidateLayer);
+          }
+        });
+      }
+
+      if (chkCoverage) {
+        chkCoverage.addEventListener('change', (e) => {
+          if (coverageLayer) {
+            if (e.target.checked) coverageLayer.addTo(map);
+            else map.removeLayer(coverageLayer);
+          }
+        });
+      }
+
+      const chkSurvey = document.getElementById('layerSurvey');
+      if (chkSurvey) {
+        chkSurvey.addEventListener('change', (e) => {
+          if (surveyLayer) {
+            if (e.target.checked) surveyLayer.addTo(map);
+            else map.removeLayer(surveyLayer);
+          }
+        });
+      }
+
+      const chkRSSI = document.getElementById('layerRSSI');
+      if (chkRSSI) {
+        chkRSSI.addEventListener('change', (e) => {
+          const legend = document.getElementById('heatmapLegend');
+          if (heatmapLayer) {
+            if (e.target.checked) {
+              heatmapLayer.addTo(map);
+              if (legend && fallbackHeatmapData) legend.style.display = 'block';
+            } else {
+              map.removeLayer(heatmapLayer);
+              if (legend) legend.style.display = 'none';
+            }
+          }
+          if (fallbackHeatmapData && redrawFallback) redrawFallback();
+        });
+      }
+
+      const chkGaps = document.getElementById('layerGaps');
+      if (chkGaps) {
+        chkGaps.addEventListener('change', (e) => {
+          if (gapLayer) {
+            if (e.target.checked) gapLayer.addTo(map);
+            else map.removeLayer(gapLayer);
+          }
+          if (fallbackGapData && redrawFallback) redrawFallback();
+        });
+      }
+    }
+
+    // --- Public JavaScript API Hooks Called by PySide6 MapView ---
+
+    window.updateUAVPosition = function(lat, lon, alt, heading, armed, mode) {
+      lastUAVPos = [lat, lon];
+      const headingDeg = heading || 0;
+
+      if (map) {
+        const uavIcon = L.icon({
+          iconUrl: createUAVIconSvg(headingDeg),
+          iconSize: [36, 36],
+          iconAnchor: [18, 18],
+          popupAnchor: [0, -18],
+          className: 'uav-marker-icon'
+        });
+
+        if (!uavMarker) {
+          uavMarker = L.marker([lat, lon], { icon: uavIcon }).addTo(map);
+          uavMarker.bindPopup(`<b>UAV System #1</b><br>Mode: ${mode}<br>Alt: ${alt}m`);
+        } else {
+          uavMarker.setLatLng([lat, lon]);
+          uavMarker.setIcon(uavIcon);
+          uavMarker.getPopup().setContent(`<b>UAV System #1</b><br>Mode: ${mode}<br>Alt: ${typeof alt === 'number' ? alt.toFixed(1) : alt}m`);
+        }
+
+        // Add to flight track history
+        trackPoints.push([lat, lon]);
+        if (trackPoints.length > 1000) trackPoints.shift();
+        if (flightTrackPolyline) {
+          flightTrackPolyline.setLatLngs(trackPoints);
+        }
+
+        // Auto follow
+        if (isFollowMode) {
+          map.panTo([lat, lon], { animate: true, duration: 0.2 });
+        }
+      } else {
+        // Fallback canvas grid update
+        updateCanvasUAV(lat, lon, headingDeg);
+      }
+    };
+
+    window.setFollowMode = function(enabled) {
+      isFollowMode = Boolean(enabled);
+      if (isFollowMode && lastUAVPos && map) {
+        map.panTo(lastUAVPos);
+      }
+    };
+
+    window.centerOnUAV = function() {
+      if (lastUAVPos && map) {
+        map.panTo(lastUAVPos);
+      } else if (map) {
+        map.panTo(defaultCenter);
+      }
+    };
+
+    window.centerOnHome = function() {
+      if (map) {
+        map.panTo(defaultCenter);
+      }
+    };
+
+    window.clearFlightTrack = function() {
+      trackPoints = [];
+      if (flightTrackPolyline) {
+        flightTrackPolyline.setLatLngs([]);
+      }
+    };
+
+    window.setUAVDisconnected = function() {
+      if (uavMarker && map) {
+        map.removeLayer(uavMarker);
+        uavMarker = null;
+      }
+      lastUAVPos = null;
+    };
+
+    function renderMission() {
+      if (!map || !missionLayer) return;
+      missionLayer.clearLayers();
+
+      if (!currentWaypoints || currentWaypoints.length === 0) return;
+
+      const latlngs = [];
+      currentWaypoints.forEach((wp) => {
+        const lat = parseFloat(wp.lat);
+        const lon = parseFloat(wp.lon);
+        if (isNaN(lat) || isNaN(lon)) return;
+        latlngs.push([lat, lon]);
+
+        const isActive = (parseInt(wp.seq) === parseInt(activeWpSeq));
+        const markerHtml = `<div class="wp-marker ${isActive ? 'active' : ''}" style="width:24px;height:24px;line-height:24px;text-align:center;">${wp.seq}</div>`;
+        const icon = L.divIcon({
+          html: markerHtml,
+          className: '',
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+          popupAnchor: [0, -12]
+        });
+
+        const m = L.marker([lat, lon], { icon: icon });
+        const cmd = wp.command_name || 'WAYPOINT';
+        m.bindPopup(`<b>WP #${wp.seq} — ${cmd}</b><br>Alt: ${wp.alt}m<br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}`);
+        missionLayer.addLayer(m);
+      });
+
+      if (latlngs.length >= 2) {
+        missionPolyline = L.polyline(latlngs, {
+          color: '#d29922',
+          weight: 2.5,
+          opacity: 0.9,
+          dashArray: '6, 6'
+        });
+        missionLayer.addLayer(missionPolyline);
+      }
+    }
+
+    window.setMissionWaypoints = function(waypoints) {
+      if (typeof waypoints === 'string') {
+        try { currentWaypoints = JSON.parse(waypoints); } catch(e) { currentWaypoints = []; }
+      } else {
+        currentWaypoints = waypoints || [];
+      }
+      renderMission();
+    };
+
+    window.setActiveWaypoint = function(seq) {
+      activeWpSeq = parseInt(seq) || 0;
+      renderMission();
+    };
+
+    window.clearMission = function() {
+      currentWaypoints = [];
+      activeWpSeq = 0;
+      if (missionLayer) {
+        missionLayer.clearLayers();
+      }
+    };
+
+    window.setMapClickMode = function(mode) {
+      mapClickMode = mode || 'NAV';
+      const mapElem = document.getElementById('map');
+      const banner = document.getElementById('clickModeBanner');
+      if (mapClickMode === 'ADD_WAYPOINT') {
+        if (mapElem) mapElem.classList.add('crosshair-cursor');
+        if (banner) {
+          banner.textContent = "[CLICK MAP TO ADD WAYPOINT]";
+          banner.style.display = 'block';
+        }
+      } else if (mapClickMode === 'SET_DEPLOY_TARGET') {
+        if (mapElem) mapElem.classList.add('crosshair-cursor');
+        if (banner) {
+          banner.textContent = "[CLICK MAP TO SET DEPLOYMENT TARGET]";
+          banner.style.display = 'block';
+        }
+      } else {
+        if (mapElem) mapElem.classList.remove('crosshair-cursor');
+        if (banner) banner.style.display = 'none';
+      }
+    };
+
+    window.setDeploymentTarget = function(lat, lon, radius) {
+      if (!map || !targetLayer) return;
+      targetLayer.clearLayers();
+      const targetIcon = L.divIcon({
+        html: '<div class="target-marker"></div>',
+        className: '',
+        iconSize: [26, 26],
+        iconAnchor: [13, 13]
+      });
+      const m = L.marker([lat, lon], { icon: targetIcon });
+      m.bindPopup(`<b>EMERGENCY DEPLOYMENT TARGET</b><br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}<br>Radius: ${radius || 15}m`);
+      targetLayer.addLayer(m);
+
+      const ring = L.circle([lat, lon], {
+        radius: radius || 15.0,
+        color: '#f78166',
+        fillColor: '#f78166',
+        fillOpacity: 0.15,
+        weight: 1.5,
+        dashArray: '4, 4'
+      });
+      targetLayer.addLayer(ring);
+    };
+
+    window.clearDeploymentTarget = function() {
+      if (targetLayer) targetLayer.clearLayers();
+    };
+
+    let fallbackDeployedNodes = [];
+
+    window.addDeployedNode = function(node) {
+      const nodeObj = (typeof node === 'string') ? JSON.parse(node) : node;
+      fallbackDeployedNodes.push(nodeObj);
+      if (redrawFallback) redrawFallback();
+
+      if (!map || !nodesLayer) return;
+      const lat = parseFloat(nodeObj.lat);
+      const lon = parseFloat(nodeObj.lon);
+      const radius = parseFloat(nodeObj.coverage_radius_m || 250);
+
+      const nodeIcon = L.divIcon({
+        html: `<div class="node-marker">📡 ${nodeObj.node_id}</div>`,
+        className: '',
+        iconSize: [80, 24],
+        iconAnchor: [40, 12]
+      });
+      const m = L.marker([lat, lon], { icon: nodeIcon });
+      m.bindPopup(`<b>EMERGENCY RELAY: ${nodeObj.node_id}</b><br>Status: ${nodeObj.status}<br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}<br>Coverage: ${radius}m<br>Time: ${nodeObj.deploy_time}`);
+      m.on('click', function() {
+        document.title = 'MAP_NODE_CLICK:' + (nodeObj.node_id || 'NODE_001');
+      });
+      nodesLayer.addLayer(m);
+
+      const covCircle = L.circle([lat, lon], {
+        radius: radius,
+        color: '#3fb950',
+        fillColor: '#238636',
+        fillOpacity: 0.12,
+        weight: 1.5
+      });
+      nodesLayer.addLayer(covCircle);
+    };
+
+    window.setDeployedNodes = function(nodesList) {
+      const list = (typeof nodesList === 'string') ? JSON.parse(nodesList) : nodesList;
+      fallbackDeployedNodes = Array.isArray(list) ? list : [];
+      if (redrawFallback) redrawFallback();
+
+      if (!map || !nodesLayer) return;
+      nodesLayer.clearLayers();
+      if (Array.isArray(list)) {
+        list.forEach((n) => window.addDeployedNode(n));
+      }
+    };
+
+    window.clearDeployedNodes = function() {
+      fallbackDeployedNodes = [];
+      if (redrawFallback) redrawFallback();
+      if (nodesLayer) nodesLayer.clearLayers();
+    };
+
+    window.updateNodeCoverageRadius = function(newRadius) {
+      const r = parseFloat(newRadius) || 250;
+      if (fallbackDeployedNodes && fallbackDeployedNodes.length > 0) {
+        fallbackDeployedNodes.forEach(n => { n.coverage_radius_m = r; });
+        if (redrawFallback) redrawFallback();
+      }
+      if (map && nodesLayer) {
+        nodesLayer.eachLayer(layer => {
+          if (layer instanceof L.Circle) {
+            layer.setRadius(r);
+          }
+        });
+      }
+    };
+
+    // --- Phase 7: Disaster Area Planning JS API ---
+    let fallbackDisasterArea = null;
+    let fallbackHazards = [];
+    let redrawFallback = function() {};
+
+    window.setDisasterArea = function(areaData) {
+      const area = (typeof areaData === 'string') ? JSON.parse(areaData) : areaData;
+      fallbackDisasterArea = area;
+
+      if (map && disasterLayer) {
+        disasterLayer.clearLayers();
+        if (area && area.vertices && area.vertices.length >= 3) {
+          const latlngs = area.vertices.map(v => [parseFloat(v.lat), parseFloat(v.lon)]);
+
+          // Shaded disaster polygon with dashed amber border
+          const poly = L.polygon(latlngs, {
+            color: '#d29922',
+            fillColor: '#d29922',
+            fillOpacity: 0.18,
+            weight: 2.5,
+            dashArray: '6, 6'
+          });
+          disasterLayer.addLayer(poly);
+
+          // Vertex Badges (V1, V2, ...)
+          area.vertices.forEach(v => {
+            const vIcon = L.divIcon({
+              html: `<div class="vertex-marker">V${v.seq}</div>`,
+              className: '',
+              iconSize: [22, 22],
+              iconAnchor: [11, 11]
+            });
+            const vm = L.marker([parseFloat(v.lat), parseFloat(v.lon)], { icon: vIcon });
+            vm.bindPopup(`<b>Disaster Boundary Vertex V${v.seq}</b><br>Lat: ${parseFloat(v.lat).toFixed(6)}<br>Lon: ${parseFloat(v.lon).toFixed(6)}`);
+            disasterLayer.addLayer(vm);
+          });
+
+          // Centroid Info Badge
+          if (area.centroid) {
+            const cLat = parseFloat(area.centroid.lat);
+            const cLon = parseFloat(area.centroid.lon);
+            const areaKm = area.area_sq_km || (area.area_sq_m ? (area.area_sq_m / 1e6).toFixed(2) : '0.00');
+            const cIcon = L.divIcon({
+              html: `<div class="area-centroid-badge">⚠ ${area.name || 'DISASTER AREA'}<br>${areaKm} km² (${area.area_hectares || 0} ha)</div>`,
+              className: '',
+              iconSize: [180, 36],
+              iconAnchor: [90, 18]
+            });
+            disasterLayer.addLayer(L.marker([cLat, cLon], { icon: cIcon }));
+          }
+        }
+      }
+
+      const canvas = document.getElementById('fallbackCanvas');
+      if (canvas && canvas.style.display === 'block') {
+        redrawFallback();
+      }
+    };
+
+    window.clearDisasterArea = function() {
+      fallbackDisasterArea = null;
+      if (disasterLayer) disasterLayer.clearLayers();
+      const canvas = document.getElementById('fallbackCanvas');
+      if (canvas && canvas.style.display === 'block') {
+        redrawFallback();
+      }
+    };
+
+    window.setHazardZones = function(hazardsData) {
+      const hazards = (typeof hazardsData === 'string') ? JSON.parse(hazardsData) : hazardsData;
+      fallbackHazards = Array.isArray(hazards) ? hazards : [];
+
+      if (map && hazardLayer) {
+        hazardLayer.clearLayers();
+        if (Array.isArray(hazards)) {
+          hazards.forEach(h => {
+            const lat = parseFloat(h.lat);
+            const lon = parseFloat(h.lon);
+            const rad = parseFloat(h.radius_m || 100);
+
+            const circle = L.circle([lat, lon], {
+              radius: rad,
+              color: '#f85149',
+              fillColor: '#da3633',
+              fillOpacity: 0.25,
+              weight: 2,
+              dashArray: '5, 5'
+            });
+            hazardLayer.addLayer(circle);
+
+            const hIcon = L.divIcon({
+              html: `<div class="hazard-marker">⚠️ ${h.name} (${rad}m)</div>`,
+              className: '',
+              iconSize: [160, 22],
+              iconAnchor: [80, 11]
+            });
+            hazardLayer.addLayer(L.marker([lat, lon], { icon: hIcon }));
+          });
+        }
+      }
+
+      const canvas = document.getElementById('fallbackCanvas');
+      if (canvas && canvas.style.display === 'block') {
+        redrawFallback();
+      }
+    };
+
+    window.clearHazardZones = function() {
+      fallbackHazards = [];
+      if (hazardLayer) hazardLayer.clearLayers();
+      const canvas = document.getElementById('fallbackCanvas');
+      if (canvas && canvas.style.display === 'block') {
+        redrawFallback();
+      }
+    };
+
+    // --- Phase 8: Deployment Algorithm Candidates JS API ---
+    let fallbackCandidates = [];
+
+    window.setCandidates = function(candidatesData) {
+      const candidates = (typeof candidatesData === 'string') ? JSON.parse(candidatesData) : candidatesData;
+      fallbackCandidates = Array.isArray(candidates) ? candidates : [];
+
+      if (map) {
+        if (!candidateLayer) candidateLayer = L.layerGroup().addTo(map);
+        if (!coverageLayer) coverageLayer = L.layerGroup().addTo(map);
+        candidateLayer.clearLayers();
+        coverageLayer.clearLayers();
+
+        if (Array.isArray(candidates)) {
+          const selectedNodes = [];
+
+          candidates.forEach(c => {
+            const lat = parseFloat(c.lat);
+            const lon = parseFloat(c.lon);
+            const cid = c.candidate_id || "C-01";
+            const isSel = Boolean(c.is_selected);
+
+            if (isSel) {
+              selectedNodes.push(c);
+
+              // 1. RF Coverage Circle (250m radius)
+              const covCircle = L.circle([lat, lon], {
+                radius: parseFloat(c.coverage_radius_m || 250.0),
+                color: '#388bfd',
+                fillColor: '#1f6feb',
+                fillOpacity: 0.16,
+                weight: 1.5,
+                dashArray: '6, 6'
+              });
+              coverageLayer.addLayer(covCircle);
+
+              // 2. Glowing Selected Badge
+              const selIcon = L.divIcon({
+                html: `<div class="selected-candidate-badge">${cid}</div>`,
+                className: '',
+                iconSize: [26, 26],
+                iconAnchor: [13, 13]
+              });
+              const selMarker = L.marker([lat, lon], { icon: selIcon });
+              selMarker.bindPopup(`<b>Optimal Site ${cid}</b><br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}<br>Coverage: ${(c.coverage_ratio * 100).toFixed(1)}%`);
+              selMarker.on('click', () => {
+                document.title = "MAP_CANDIDATE_CLICK:" + cid;
+              });
+              candidateLayer.addLayer(selMarker);
+            } else {
+              // Standard unselected candidate point
+              const candIcon = L.divIcon({
+                html: `<div class="candidate-marker" title="${cid}"></div>`,
+                className: '',
+                iconSize: [12, 12],
+                iconAnchor: [6, 6]
+              });
+              const candMarker = L.marker([lat, lon], { icon: candIcon });
+              candMarker.bindPopup(`<b>Candidate Site ${cid}</b><br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}`);
+              candMarker.on('click', () => {
+                document.title = "MAP_CANDIDATE_CLICK:" + cid;
+              });
+              candidateLayer.addLayer(candMarker);
+            }
+          });
+
+          // 3. Mesh Backhaul Interconnection Lines
+          for (let i = 0; i < selectedNodes.length; i++) {
+            for (let j = i + 1; j < selectedNodes.length; j++) {
+              const n1 = selectedNodes[i];
+              const n2 = selectedNodes[j];
+              if (n1.mesh_linked_nodes && n1.mesh_linked_nodes.includes(n2.candidate_id)) {
+                const linkLine = L.polyline([[n1.lat, n1.lon], [n2.lat, n2.lon]], {
+                  color: '#58a6ff',
+                  weight: 2,
+                  dashArray: '4, 4',
+                  opacity: 0.75
+                });
+                coverageLayer.addLayer(linkLine);
+              }
+            }
+          }
+        }
+      }
+
+      const canvas = document.getElementById('fallbackCanvas');
+      if (canvas && canvas.style.display === 'block') {
+        redrawFallback();
+      }
+    };
+
+    window.clearCandidates = function() {
+      fallbackCandidates = [];
+      if (candidateLayer) candidateLayer.clearLayers();
+      if (coverageLayer) coverageLayer.clearLayers();
+      const canvas = document.getElementById('fallbackCanvas');
+      if (canvas && canvas.style.display === 'block') {
+        redrawFallback();
+      }
+    };
+
+    // --- Phase 12: RF Survey JS API ---
+    window.displaySurveyPlan = function(planData) {
+      const plan = (typeof planData === 'string') ? JSON.parse(planData) : planData;
+      fallbackSurveyPlan = plan;
+      fallbackSurveySamples = [];
+      if (redrawFallback) redrawFallback();
+
+      const chkSurvey = document.getElementById('layerSurvey');
+      if (chkSurvey) chkSurvey.checked = true;
+
+      if (map) {
+        if (!surveyLayer) surveyLayer = L.layerGroup().addTo(map);
+        surveyLayer.clearLayers();
+
+        if (!plan || !plan.waypoints || plan.waypoints.length === 0) return;
+
+        // 1. Serpentine Lawnmower Polyline
+        const coords = plan.waypoints.map(wp => [wp.lat, wp.lon]);
+        const pathLine = L.polyline(coords, {
+          color: '#388bfd',
+          weight: 2.5,
+          dashArray: '6, 4',
+          opacity: 0.85
+        });
+        surveyLayer.addLayer(pathLine);
+
+        // 2. Waypoint markers
+        plan.waypoints.forEach(wp => {
+          const m = L.circleMarker([wp.lat, wp.lon], {
+            radius: 4,
+            color: '#58a6ff',
+            fillColor: '#1f6feb',
+            fillOpacity: 0.8,
+            weight: 1.5
+          });
+          m.bindPopup(`<b>Survey Waypoint #${wp.index}</b><br>Transect: ${wp.transect_id}<br>Alt: ${wp.altitude_m}m<br>Lat: ${wp.lat.toFixed(6)}<br>Lon: ${wp.lon.toFixed(6)}`);
+          surveyLayer.addLayer(m);
+        });
+      }
+    };
+
+    window.updateSurveyProgress = function(sampleData) {
+      const sample = (typeof sampleData === 'string') ? JSON.parse(sampleData) : sampleData;
+      if (!sample) return;
+      fallbackSurveySamples.push(sample);
+      if (redrawFallback) redrawFallback();
+
+      if (map && surveyLayer) {
+        let col = '#3fb950';
+        if (sample.rssi_dbm < -85.0) col = '#f85149';
+        else if (sample.rssi_dbm < -75.0) col = '#d29922';
+        else if (sample.rssi_dbm < -65.0) col = '#58a6ff';
+
+        const m = L.circleMarker([sample.lat, sample.lon], {
+          radius: 6.5,
+          color: '#ffffff',
+          fillColor: col,
+          fillOpacity: 0.95,
+          weight: 2
+        });
+        m.bindPopup(`<b>Survey Sample #${sample.index}</b><br>RSSI: <b>${sample.rssi_dbm} dBm</b><br>Quality: ${sample.quality}<br>Time: ${sample.timestamp}`);
+        surveyLayer.addLayer(m);
+      }
+    };
+
+    window.clearSurvey = function() {
+      fallbackSurveyPlan = null;
+      fallbackSurveySamples = [];
+      if (redrawFallback) redrawFallback();
+      if (surveyLayer) surveyLayer.clearLayers();
+    };
+
+    // --- Phase 13: RSSI Heatmap JS API ---
+    window.displayRssiHeatmap = function(geojsonData) {
+      const data = (typeof geojsonData === 'string') ? JSON.parse(geojsonData) : geojsonData;
+      fallbackHeatmapData = data;
+      if (redrawFallback) redrawFallback();
+
+      const chkRSSI = document.getElementById('layerRSSI');
+      if (chkRSSI) chkRSSI.checked = true;
+
+      const legend = document.getElementById('heatmapLegend');
+      if (legend) legend.style.display = 'block';
+
+      if (map) {
+        if (!heatmapLayer) heatmapLayer = L.layerGroup().addTo(map);
+        heatmapLayer.clearLayers();
+
+        if (!data || !data.features || data.features.length === 0) return;
+
+        data.features.forEach(feat => {
+          const coords = feat.geometry.coordinates[0];
+          // Leaflet polygon uses [lat, lon]
+          const latlngs = coords.map(c => [c[1], c[0]]);
+          const props = feat.properties;
+
+          const poly = L.polygon(latlngs, {
+            color: props.color || '#2ecc71',
+            fillColor: props.color || '#2ecc71',
+            fillOpacity: props.fillOpacity || 0.45,
+            weight: 0.5,
+            stroke: true,
+            interactive: true
+          });
+
+          poly.bindPopup(
+            `<b>RF Signal: ${props.rssi_dbm} dBm</b><br>` +
+            `Quality: <b>${props.category}</b><br>` +
+            `Grid Cell: [${props.row}, ${props.col}]`
+          );
+
+          heatmapLayer.addLayer(poly);
+        });
+      }
+    };
+
+    window.clearRssiHeatmap = function() {
+      fallbackHeatmapData = null;
+      const legend = document.getElementById('heatmapLegend');
+      if (legend) legend.style.display = 'none';
+      if (heatmapLayer) heatmapLayer.clearLayers();
+      if (redrawFallback) redrawFallback();
+    };
+
+    // --- Phase 14: Coverage Gap JS API ---
+    window.displayCoverageGaps = function(geojsonData) {
+      const data = (typeof geojsonData === 'string') ? JSON.parse(geojsonData) : geojsonData;
+      fallbackGapData = data;
+      if (redrawFallback) redrawFallback();
+
+      const chkGaps = document.getElementById('layerGaps');
+      if (chkGaps) chkGaps.checked = true;
+
+      if (map) {
+        if (!gapLayer) gapLayer = L.layerGroup().addTo(map);
+        gapLayer.clearLayers();
+
+        if (!data || !data.features || data.features.length === 0) return;
+
+        data.features.forEach(feat => {
+          const coords = feat.geometry.coordinates[0];
+          const latlngs = coords.map(c => [c[1], c[0]]);
+          const props = feat.properties;
+
+          // Red dashed gap boundary polygon
+          const poly = L.polygon(latlngs, {
+            color: '#f85149',
+            fillColor: '#da3633',
+            fillOpacity: 0.32,
+            weight: 2.5,
+            dashArray: '6, 4',
+            interactive: true
+          });
+
+          poly.bindPopup(
+            `<b>⚠️ ${props.gap_id} (COVERAGE SHADOW / GAP)</b><br>` +
+            `Area: <b>${props.area_km2} km²</b><br>` +
+            `Severity: <span style="color:#f85149;font-weight:bold;">${props.severity}</span><br>` +
+            `Mean RSSI: ${props.mean_rssi_dbm} dBm<br>` +
+            `Centroid: [${props.centroid[0].toFixed(5)}, ${props.centroid[1].toFixed(5)}]<br>` +
+            `Recommended Relay: [${props.recommended_relay[0].toFixed(5)}, ${props.recommended_relay[1].toFixed(5)}]`
+          );
+          gapLayer.addLayer(poly);
+
+          // Centroid tactical warning badge
+          const cIcon = L.divIcon({
+            html: `<div style="background: rgba(218, 54, 51, 0.95); border: 1px solid #f85149; border-radius: 3px; padding: 2px 6px; font-size: 9px; font-weight: bold; color: #ffffff; white-space: nowrap; box-shadow: 0 0 8px rgba(218, 54, 51, 0.6); font-family: Consolas, monospace;">⚠️ ${props.gap_id} (${props.area_km2} km²)</div>`,
+            className: '',
+            iconSize: [130, 20],
+            iconAnchor: [65, 10]
+          });
+          gapLayer.addLayer(L.marker([props.centroid[0], props.centroid[1]], { icon: cIcon }));
+        });
+      }
+    };
+
+    window.clearCoverageGaps = function() {
+      fallbackGapData = null;
+      if (gapLayer) gapLayer.clearLayers();
+      if (redrawFallback) redrawFallback();
+    };
+
+    // --- Offline Canvas Grid Implementation ---
+    function initFallbackGrid() {
+      const canvas = document.getElementById('fallbackCanvas');
+      canvas.style.display = 'block';
+      const ctx = canvas.getContext('2d');
+      const status = document.getElementById('mapEngineStatus');
+      status.textContent = "TACTICAL GRID — OFFLINE SCHEMATIC (LIVE UAV TRACK ACTIVE)";
+
+      function latLonToCanvas(lat, lon) {
+        const cx = canvas.width / 2;
+        const cy = canvas.height / 2;
+        const scale = 36000;
+        const x = cx + (lon - defaultCenter[1]) * scale * Math.cos(defaultCenter[0] * Math.PI / 180);
+        const y = cy - (lat - defaultCenter[0]) * scale;
+        return [x, y];
+      }
+
+      function canvasToLatLon(x, y) {
+        const cx = canvas.width / 2;
+        const cy = canvas.height / 2;
+        const scale = 36000;
+        const lon = defaultCenter[1] + (x - cx) / (scale * Math.cos(defaultCenter[0] * Math.PI / 180));
+        const lat = defaultCenter[0] - (y - cy) / scale;
+        return [lat, lon];
+      }
+
+      canvas.addEventListener('click', function(e) {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const [lat, lon] = canvasToLatLon(x, y);
+
+        // Check if deployed node clicked (Phase 10)
+        if (fallbackDeployedNodes && fallbackDeployedNodes.length > 0) {
+          for (let n of fallbackDeployedNodes) {
+            const [nx, ny] = latLonToCanvas(parseFloat(n.lat), parseFloat(n.lon));
+            if (Math.hypot(x - nx, y - ny) <= 20) {
+              document.title = "MAP_NODE_CLICK:" + (n.node_id || "NODE_001");
+              return;
+            }
+          }
+        }
+
+        // Check if candidate clicked
+        if (fallbackCandidates && fallbackCandidates.length > 0) {
+          for (let c of fallbackCandidates) {
+            const [cx, cy] = latLonToCanvas(parseFloat(c.lat), parseFloat(c.lon));
+            if (Math.hypot(x - cx, y - cy) <= 15) {
+              document.title = "MAP_CANDIDATE_CLICK:" + (c.candidate_id || "C-01");
+              return;
+            }
+          }
+        }
+
+        if (mapClickMode === 'ADD_WAYPOINT') {
+          document.title = "MAP_CLICK:" + lat.toFixed(7) + ":" + lon.toFixed(7);
+        } else if (mapClickMode === 'SET_DEPLOY_TARGET') {
+          document.title = "MAP_TARGET_CLICK:" + lat.toFixed(7) + ":" + lon.toFixed(7);
+        } else if (mapClickMode === 'DRAW_DISASTER_AREA') {
+          document.title = "MAP_AREA_CLICK:" + lat.toFixed(7) + ":" + lon.toFixed(7);
+        }
+      });
+
+      function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        drawGrid();
+      }
+
+      function drawGrid() {
+        ctx.fillStyle = "#0a0e14";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Tactical Grid Lines
+        ctx.strokeStyle = "#16202c";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([]);
+        const step = 40;
+        for (let x = 0; x < canvas.width; x += step) {
+          ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+        }
+        for (let y = 0; y < canvas.height; y += step) {
+          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+        }
+
+        // Center reticle
+        const cx = canvas.width / 2;
+        const cy = canvas.height / 2;
+        ctx.strokeStyle = "#1f6feb";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(cx, cy, 35, 0, 2 * Math.PI); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx - 50, cy); ctx.lineTo(cx + 50, cy);
+        ctx.moveTo(cx, cy - 50); ctx.lineTo(cx, cy + 50);
+        ctx.stroke();
+
+        ctx.fillStyle = "#58a6ff";
+        ctx.font = "10px Consolas, monospace";
+        ctx.fillText(`CENTER: ${defaultCenter[0].toFixed(4)} N, ${defaultCenter[1].toFixed(4)} W`, cx + 10, cy - 10);
+
+        // Draw Disaster Area Polygon (if any)
+        if (fallbackDisasterArea && fallbackDisasterArea.vertices && fallbackDisasterArea.vertices.length >= 3) {
+          const pts = fallbackDisasterArea.vertices.map(v => latLonToCanvas(parseFloat(v.lat), parseFloat(v.lon)));
+          
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(pts[0][0], pts[0][1]);
+          for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i][0], pts[i][1]);
+          }
+          ctx.closePath();
+          ctx.fillStyle = "rgba(210, 153, 34, 0.22)";
+          ctx.fill();
+          ctx.strokeStyle = "#d29922";
+          ctx.lineWidth = 2.5;
+          ctx.setLineDash([8, 6]);
+          ctx.stroke();
+          ctx.restore();
+
+          // Vertex markers (V1, V2, ...)
+          pts.forEach((pt, idx) => {
+            ctx.save();
+            ctx.fillStyle = "#d29922";
+            ctx.beginPath();
+            ctx.arc(pt[0], pt[1], 10, 0, 2 * Math.PI);
+            ctx.fill();
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.fillStyle = "#ffffff";
+            ctx.font = "bold 9px 'Segoe UI', Inter, sans-serif";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText("V" + (idx + 1), pt[0], pt[1]);
+            ctx.restore();
+          });
+
+          // Centroid Badge
+          if (fallbackDisasterArea.centroid) {
+            const [centX, centY] = latLonToCanvas(parseFloat(fallbackDisasterArea.centroid.lat), parseFloat(fallbackDisasterArea.centroid.lon));
+            const name = fallbackDisasterArea.name || "DISASTER AREA";
+            const areaKm = fallbackDisasterArea.area_sq_km || "0.85";
+            const ha = fallbackDisasterArea.area_hectares || "85.0";
+            
+            ctx.save();
+            const badgeW = 220;
+            const badgeH = 34;
+            const bx = centX - badgeW / 2;
+            const by = centY + 35;
+            ctx.fillStyle = "rgba(13, 17, 23, 0.92)";
+            ctx.strokeStyle = "#d29922";
+            ctx.lineWidth = 1.5;
+            ctx.fillRect(bx, by, badgeW, badgeH);
+            ctx.strokeRect(bx, by, badgeW, badgeH);
+            
+            ctx.fillStyle = "#f0883e";
+            ctx.font = "bold 10px 'Segoe UI', Inter, sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText("⚠ " + name, centX, by + 13);
+            
+            ctx.fillStyle = "#c9d1d9";
+            ctx.font = "9px 'Segoe UI', Inter, sans-serif";
+            ctx.fillText(`${areaKm} km² (${ha} ha) | Vertices: ${fallbackDisasterArea.vertices.length}`, centX, by + 26);
+            ctx.restore();
+          }
+        }
+
+        // Draw Hazard Exclusion Zones (if any)
+        if (fallbackHazards && fallbackHazards.length > 0) {
+          fallbackHazards.forEach(h => {
+            const [hx, hy] = latLonToCanvas(parseFloat(h.lat), parseFloat(h.lon));
+            const radMeters = parseFloat(h.radius_m || 100);
+            const radPx = Math.max(15, radMeters * (36000 / 111000));
+            
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(hx, hy, radPx, 0, 2 * Math.PI);
+            ctx.fillStyle = "rgba(248, 81, 73, 0.25)";
+            ctx.fill();
+            ctx.strokeStyle = "#f85149";
+            ctx.lineWidth = 2;
+            ctx.setLineDash([5, 5]);
+            ctx.stroke();
+            
+            // Badge
+            ctx.fillStyle = "rgba(22, 27, 34, 0.9)";
+            ctx.strokeStyle = "#f85149";
+            ctx.lineWidth = 1;
+            const text = `⚠️ ${h.name} (${radMeters}m)`;
+            ctx.font = "bold 9px 'Segoe UI', Inter, sans-serif";
+            const tw = ctx.measureText(text).width + 12;
+            ctx.fillRect(hx - tw / 2, hy - 10, tw, 20);
+            ctx.strokeRect(hx - tw / 2, hy - 10, tw, 20);
+            ctx.fillStyle = "#ff7b72";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(text, hx, hy);
+            ctx.restore();
+          });
+        }
+
+        // Draw Deployment Candidates & RF Coverage (Phase 8)
+        if (fallbackCandidates && fallbackCandidates.length > 0) {
+          const selectedNodes = [];
+          fallbackCandidates.forEach(c => {
+            const [cx, cy] = latLonToCanvas(parseFloat(c.lat), parseFloat(c.lon));
+            const isSel = Boolean(c.is_selected);
+            const cid = c.candidate_id || "C-01";
+
+            if (isSel) {
+              selectedNodes.push({ c, cx, cy });
+
+              // 1. RF Coverage Circle (250m)
+              const radMeters = parseFloat(c.coverage_radius_m || 250);
+              const radPx = Math.max(20, radMeters * (36000 / 111000));
+              ctx.save();
+              ctx.beginPath();
+              ctx.arc(cx, cy, radPx, 0, 2 * Math.PI);
+              ctx.fillStyle = "rgba(56, 139, 253, 0.15)";
+              ctx.fill();
+              ctx.strokeStyle = "#388bfd";
+              ctx.lineWidth = 1.5;
+              ctx.setLineDash([6, 4]);
+              ctx.stroke();
+              ctx.restore();
+
+              // 2. Selected circular badge
+              ctx.save();
+              ctx.fillStyle = "#1f6feb";
+              ctx.beginPath();
+              ctx.arc(cx, cy, 13, 0, 2 * Math.PI);
+              ctx.fill();
+              ctx.strokeStyle = "#ffffff";
+              ctx.lineWidth = 2;
+              ctx.stroke();
+              ctx.fillStyle = "#ffffff";
+              ctx.font = "bold 9px 'Segoe UI', Inter, sans-serif";
+              ctx.textAlign = "center";
+              ctx.textBaseline = "middle";
+              ctx.fillText(cid, cx, cy);
+              ctx.restore();
+            } else {
+              // Unselected candidate dot
+              ctx.save();
+              ctx.fillStyle = "rgba(56, 139, 253, 0.55)";
+              ctx.beginPath();
+              ctx.arc(cx, cy, 4.5, 0, 2 * Math.PI);
+              ctx.fill();
+              ctx.strokeStyle = "#58a6ff";
+              ctx.lineWidth = 1;
+              ctx.stroke();
+              ctx.restore();
+            }
+          });
+
+          // 3. Draw inter-node mesh link lines
+          for (let i = 0; i < selectedNodes.length; i++) {
+            for (let j = i + 1; j < selectedNodes.length; j++) {
+              const n1 = selectedNodes[i];
+              const n2 = selectedNodes[j];
+              if (n1.c.mesh_linked_nodes && n1.c.mesh_linked_nodes.includes(n2.c.candidate_id)) {
+                ctx.save();
+                ctx.strokeStyle = "#58a6ff";
+                ctx.lineWidth = 2;
+                ctx.setLineDash([4, 4]);
+                ctx.beginPath();
+                ctx.moveTo(n1.cx, n1.cy);
+                ctx.lineTo(n2.cx, n2.cy);
+                ctx.stroke();
+                ctx.restore();
+              }
+            }
+          }
+        }
+
+        // Draw Deployed Emergency Communication Nodes (Phase 10)
+        if (fallbackDeployedNodes && fallbackDeployedNodes.length > 0) {
+          fallbackDeployedNodes.forEach(n => {
+            const [nx, ny] = latLonToCanvas(parseFloat(n.lat), parseFloat(n.lon));
+            const radMeters = parseFloat(n.coverage_radius_m || 250);
+            const radPx = Math.max(20, radMeters * (36000 / 111000));
+
+            // Coverage ring
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(nx, ny, radPx, 0, 2 * Math.PI);
+            ctx.fillStyle = "rgba(35, 134, 54, 0.15)";
+            ctx.fill();
+            ctx.strokeStyle = "#3fb950";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.restore();
+
+            // Center node badge
+            ctx.save();
+            ctx.fillStyle = "rgba(13, 17, 23, 0.95)";
+            ctx.strokeStyle = "#3fb950";
+            ctx.lineWidth = 1.5;
+            const badgeText = `📡 ${n.node_id || 'NODE_001'}`;
+            ctx.font = "bold 9px Consolas, monospace";
+            const bw = ctx.measureText(badgeText).width + 12;
+            ctx.fillRect(nx - bw / 2, ny - 10, bw, 20);
+            ctx.strokeRect(nx - bw / 2, ny - 10, bw, 20);
+            ctx.fillStyle = "#58a6ff";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(badgeText, nx, ny);
+            ctx.restore();
+          });
+        }
+
+        // Draw Lawnmower RF Survey Pattern (Phase 12)
+        if (fallbackSurveyPlan && fallbackSurveyPlan.waypoints && fallbackSurveyPlan.waypoints.length > 0) {
+          const wps = fallbackSurveyPlan.waypoints;
+          const canvasPts = wps.map(wp => latLonToCanvas(wp.lat, wp.lon));
+
+          // Draw serpentine flight line
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(canvasPts[0][0], canvasPts[0][1]);
+          for (let i = 1; i < canvasPts.length; i++) {
+            ctx.lineTo(canvasPts[i][0], canvasPts[i][1]);
+          }
+          ctx.strokeStyle = "#388bfd";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 4]);
+          ctx.stroke();
+          ctx.restore();
+
+          // Draw waypoint dots
+          canvasPts.forEach((pt, i) => {
+            const wp = wps[i];
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(pt[0], pt[1], 4, 0, 2 * Math.PI);
+            ctx.fillStyle = wp.visited ? "#3fb950" : "#1f6feb";
+            ctx.fill();
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.restore();
+          });
+        }
+
+        // Draw Spatial RSSI Heatmap (Phase 13)
+        const chkRSSI = document.getElementById('layerRSSI');
+        if ((!chkRSSI || chkRSSI.checked) && fallbackHeatmapData && fallbackHeatmapData.features && fallbackHeatmapData.features.length > 0) {
+          fallbackHeatmapData.features.forEach(feat => {
+            const coords = feat.geometry.coordinates[0];
+            const pts = coords.slice(0, 4).map(c => latLonToCanvas(c[1], c[0]));
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(pts[0][0], pts[0][1]);
+            for (let i = 1; i < pts.length; i++) {
+              ctx.lineTo(pts[i][0], pts[i][1]);
+            }
+            ctx.closePath();
+            ctx.fillStyle = feat.properties.color || '#2ecc71';
+            ctx.globalAlpha = feat.properties.fillOpacity || 0.45;
+            ctx.fill();
+            ctx.strokeStyle = feat.properties.color || '#2ecc71';
+            ctx.globalAlpha = 0.25;
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+            ctx.restore();
+          });
+        }
+
+        // Draw Coverage Gap Zones (Phase 14)
+        const chkGaps = document.getElementById('layerGaps');
+        if ((!chkGaps || chkGaps.checked) && fallbackGapData && fallbackGapData.features && fallbackGapData.features.length > 0) {
+          fallbackGapData.features.forEach(feat => {
+            const props = feat.properties;
+            const coords = feat.geometry.coordinates[0];
+            const pts = coords.map(c => latLonToCanvas(c[1], c[0]));
+
+            if (pts.length < 3) return;
+
+            // Red dashed perimeter polygon
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(pts[0][0], pts[0][1]);
+            for (let i = 1; i < pts.length; i++) {
+              ctx.lineTo(pts[i][0], pts[i][1]);
+            }
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(218, 54, 51, 0.28)';
+            ctx.fill();
+            ctx.strokeStyle = '#f85149';
+            ctx.lineWidth = 2.5;
+            ctx.setLineDash([7, 5]);
+            ctx.stroke();
+            ctx.restore();
+
+            // Centroid ⚠️ GAP badge
+            const centLat = props.centroid ? props.centroid[0] : (pts.reduce((s, p) => s + p[1], 0) / pts.length);
+            const centLon = props.centroid ? props.centroid[1] : (pts.reduce((s, p) => s + p[0], 0) / pts.length);
+            const [bx, by] = latLonToCanvas(centLat, centLon);
+
+            ctx.save();
+            const gapLabel = `⚠ ${props.gap_id || 'GAP'} (${props.area_km2 || '?'} km²)`;
+            ctx.font = 'bold 9px Consolas, monospace';
+            const textW = ctx.measureText(gapLabel).width + 14;
+            const textH = 18;
+            ctx.fillStyle = 'rgba(13, 17, 23, 0.92)';
+            ctx.strokeStyle = '#f85149';
+            ctx.lineWidth = 1.5;
+            ctx.fillRect(bx - textW / 2, by - textH / 2, textW, textH);
+            ctx.strokeRect(bx - textW / 2, by - textH / 2, textW, textH);
+            ctx.fillStyle = '#f85149';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(gapLabel, bx, by);
+            ctx.restore();
+          });
+        }
+      }
+
+      redrawFallback = drawGrid;
+      window.addEventListener('resize', resize);
+      resize();
+    }
+
+    function updateCanvasUAV(lat, lon, heading) {
+      const canvas = document.getElementById('fallbackCanvas');
+      if (canvas.style.display !== 'block') return;
+      hud.textContent = `UAV LIVE [CANVAS]: LAT: ${lat.toFixed(6)} | LON: ${lon.toFixed(6)} | HDG: ${heading.toFixed(1)}°`;
+    }
+
+    // Dynamic Leaflet Loader
+    const script = document.createElement('script');
+    script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+    script.onload = initLeaflet;
+    script.onerror = initFallbackGrid;
+    document.head.appendChild(script);
+
+    setTimeout(() => {
+      if (!map && document.getElementById('fallbackCanvas').style.display !== 'block') {
+        initFallbackGrid();
+      }
+    }, 2500);
+  </script>
+</body>
+</html>
