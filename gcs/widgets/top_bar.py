@@ -144,6 +144,8 @@ class TopBar(QWidget):
         if status == ConnectionState.CONNECTED:
             self.badge_conn.setText("● CONNECTED")
             self.badge_conn.setProperty("class", "status-badge status-badge-connected")
+            self.badge_sim.setText("SITL: ONLINE | GAZEBO: ONLINE")
+            self.badge_sim.setProperty("class", "status-badge status-badge-safe")
             self.btn_top_connect.setText("DISCONNECT")
             self.btn_top_connect.setStyleSheet("""
                 QPushButton {
@@ -167,10 +169,14 @@ class TopBar(QWidget):
         elif status == ConnectionState.CONNECTION_LOST:
             self.badge_conn.setText("⚠ CONNECTION LOST")
             self.badge_conn.setProperty("class", "status-badge status-badge-disconnected")
+            self.badge_sim.setText("SITL: OFFLINE | GAZEBO: OFFLINE")
+            self.badge_sim.setProperty("class", "status-badge status-badge-simulation")
             self.btn_top_connect.setText("RECONNECT")
         else:
             self.badge_conn.setText("● DISCONNECTED")
             self.badge_conn.setProperty("class", "status-badge status-badge-disconnected")
+            self.badge_sim.setText("SITL: OFFLINE | GAZEBO: OFFLINE")
+            self.badge_sim.setProperty("class", "status-badge status-badge-simulation")
             self.btn_top_connect.setText("CONNECT")
             self.btn_top_connect.setStyleSheet("""
                 QPushButton {
@@ -189,6 +195,8 @@ class TopBar(QWidget):
             """)
         self.badge_conn.style().unpolish(self.badge_conn)
         self.badge_conn.style().polish(self.badge_conn)
+        self.badge_sim.style().unpolish(self.badge_sim)
+        self.badge_sim.style().polish(self.badge_sim)
 
     def on_mode_changed(self, mode: str):
         self.label_mode.setText(f"MODE: {mode}")
