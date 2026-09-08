@@ -46,6 +46,15 @@ class QMavlinkWorker(QThread):
         self._connected = False
         self._sysid = 1
         self._compid = 1
+        self._px4_configured = False
+
+        # Manual control stick states (-1000..1000, throttle 0..1000 with 500 center)
+        self._manual_x = 0
+        self._manual_y = 0
+        self._manual_z = 500
+        self._manual_r = 0
+        self._manual_active = False
+        self._last_manual_send = 0.0
 
     # ──────────────────────────────────────────────────────────────────────────
     # Thread Run Method
@@ -106,6 +115,26 @@ class QMavlinkWorker(QThread):
                                 "groundspeed": 12.0,
                             })
 
+                # Manual remote control in mock mode
+                if self._manual_active:
+                    vx = (self._manual_x / 1000.0) * 0.00008
+                    vy = (self._manual_y / 1000.0) * 0.00008
+                    vz = ((self._manual_z - 500) / 500.0) * 0.4
+                    vr = (self._manual_r / 1000.0) * 4.0
+                    self._mock_uav_pos[0] += vx
+                    self._mock_uav_pos[1] += vy
+                    cur_alt = self._mock_telemetry_state.get("alt_rel", 5.0)
+                    new_alt = max(0.0, cur_alt + vz)
+                    cur_hdg = self._mock_telemetry_state.get("heading", 0.0)
+                    new_hdg = (cur_hdg + vr + 360) % 360
+                    self._mock_telemetry_state.update({
+                        "lat": self._mock_uav_pos[0],
+                        "lon": self._mock_uav_pos[1],
+                        "alt_rel": new_alt,
+                        "heading": new_hdg,
+                        "mode": "POSCTL"
+                    })
+
                 telemetry.update(self._mock_telemetry_state)
                 self._mutex.unlock()
                 self.telemetry_updated.emit(telemetry)
@@ -153,6 +182,22 @@ class QMavlinkWorker(QThread):
                     except Exception:
                         pass
 
+                # Stream 10Hz MANUAL_CONTROL message if manual control is active
+                if now - self._last_manual_send >= 0.1:
+                    self._last_manual_send = now
+                    if self._manual_active and self._mav is not None:
+                        try:
+                            self._mav.mav.manual_control_send(
+                                self._sysid,
+                                self._manual_x,
+                                self._manual_y,
+                                self._manual_z,
+                                self._manual_r,
+                                0
+                            )
+                        except Exception:
+                            pass
+
                 msg = self._mav.recv_match(blocking=True, timeout=0.2)
 
                 now = time.time()
@@ -179,6 +224,7 @@ class QMavlinkWorker(QThread):
                         if not self._connected:
                             self._connected = True
                             self.connected_signal.emit(self._sysid, self._compid, vehicle_type)
+                            self._configure_px4_sitl()
 
                     elif msg_type == "GLOBAL_POSITION_INT":
                         telemetry_cache.update({
@@ -441,6 +487,90 @@ class QMavlinkWorker(QThread):
             self.dispatch_mock(result)
         else:
             self.dispatch_real(commands.send_payload_release, servo_channel, pwm)
+
+    def set_manual_control(self, x: int = 0, y: int = 0, z: int = 500, r: int = 0, active: bool = True):
+        """Update stick inputs for 10Hz MANUAL_CONTROL loop.
+
+        x: pitch (-1000..1000, forward/back)
+        y: roll (-1000..1000, right/left)
+        z: throttle (0..1000, 500=hover)
+        r: yaw (-1000..1000, clockwise/counter-clockwise)
+        """
+        self._mutex.lock()
+        self._manual_x = int(max(-1000, min(1000, x)))
+        self._manual_y = int(max(-1000, min(1000, y)))
+        self._manual_z = int(max(0, min(1000, z)))
+        self._manual_r = int(max(-1000, min(1000, r)))
+        self._manual_active = active
+        self._mutex.unlock()
+
+    def stop_manual_control(self):
+        """Immediately reset manual sticks to neutral hover (x=0, y=0, z=500, r=0)."""
+        self._mutex.lock()
+        self._manual_x = 0
+        self._manual_y = 0
+        self._manual_z = 500
+        self._manual_r = 0
+        self._manual_active = False
+        self._mutex.unlock()
+        if not self._mock_mode and self._mav is not None:
+            try:
+                self._mav.mav.manual_control_send(self._sysid, 0, 0, 500, 0, 0)
+            except Exception:
+                pass
+
+    def nudge(self, direction: str, duration_sec: float = 0.8, speed: int = 500):
+        """Issue a timed directional pulse in POSCTL mode."""
+        dx, dy, dz, dr = 0, 0, 500, 0
+        dir_upper = direction.upper()
+        if dir_upper in ("FORWARD", "UP_PAD"):
+            dx = speed
+        elif dir_upper in ("BACKWARD", "DOWN_PAD"):
+            dx = -speed
+        elif dir_upper == "LEFT":
+            dy = -speed
+        elif dir_upper == "RIGHT":
+            dy = speed
+        elif dir_upper in ("UP", "CLIMB"):
+            dz = 500 + int(speed * 0.5)
+        elif dir_upper in ("DOWN", "DESCEND"):
+            dz = 500 - int(speed * 0.5)
+        elif dir_upper in ("YAW_LEFT", "TURN_LEFT"):
+            dr = -speed
+        elif dir_upper in ("YAW_RIGHT", "TURN_RIGHT"):
+            dr = speed
+
+        self.set_manual_control(dx, dy, dz, dr, active=True)
+        import threading
+        def _reset_after():
+            time.sleep(duration_sec)
+            self.stop_manual_control()
+        threading.Thread(target=_reset_after, daemon=True).start()
+
+    def _configure_px4_sitl(self):
+        """Send SITL parameter bypasses so PX4 doesn't auto-disarm or fail power checks."""
+        if self._mock_mode or self._mav is None:
+            return
+        def _do_config():
+            try:
+                time.sleep(0.5)
+                # 1. Disable battery supply check in simulation (CBRK_SUPPLY_CHK = 894281)
+                self._mav.mav.param_set_send(
+                    self._sysid, self._compid,
+                    b"CBRK_SUPPLY_CHK", 894281.0,
+                    mavutil.mavlink.MAV_PARAM_TYPE_INT32
+                )
+                time.sleep(0.1)
+                # 2. Disable 10s auto-disarm timeout on ground (COM_DISARM_PREROL = 0)
+                self._mav.mav.param_set_send(
+                    self._sysid, self._compid,
+                    b"COM_DISARM_PREROL", 0.0,
+                    mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+                )
+            except Exception:
+                pass
+        import threading
+        threading.Thread(target=_do_config, daemon=True).start()
 
     def stop(self):
         self._running = False

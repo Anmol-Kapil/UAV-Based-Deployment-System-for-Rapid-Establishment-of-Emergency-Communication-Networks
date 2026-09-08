@@ -196,6 +196,13 @@ class LeftPanel(QWidget):
         self.sec_vehicle.add_layout(grid_v)
         self.scroll_layout.addWidget(self.sec_vehicle)
 
+        # 1B. MANUAL REMOTE FLIGHT SECTION (Phase 17)
+        from gcs.widgets.manual_control_view import ManualControlView
+        self.sec_manual = ToolSection("MANUAL REMOTE FLIGHT")
+        self.manual_view = ManualControlView()
+        self.sec_manual.add_widget(self.manual_view)
+        self.scroll_layout.addWidget(self.sec_manual)
+
         # 2. MISSION SECTION
         self.sec_mission = ToolSection("MISSION")
         grid_m = QGridLayout()
@@ -479,7 +486,13 @@ class LeftPanel(QWidget):
     def set_worker(self, worker):
         """Inject MAVLink worker reference for command dispatch."""
         self._worker = worker
+        if hasattr(self, "manual_view"):
+            self.manual_view.set_worker(worker)
         self._on_connection_changed(app_state.connection_status)
+
+    @property
+    def manual_control_view(self):
+        return self.manual_view
 
 
     def _dispatch(self, mock_func, real_func=None, *args):
@@ -514,7 +527,10 @@ class LeftPanel(QWidget):
         dlg = ConfirmDialog("TAKEOFF", "Vehicle will climb to specified altitude.",
             parent=self, ask_altitude=True, default_altitude=5.0)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._dispatch("mock_takeoff", "send_takeoff", dlg.get_altitude())
+            alt = dlg.get_altitude()
+            lat = app_state.uav_latitude
+            lon = app_state.uav_longitude
+            self._dispatch("mock_takeoff", "send_takeoff", alt, lat, lon)
 
     def _on_land(self):
         self._dispatch("mock_land", "send_land")

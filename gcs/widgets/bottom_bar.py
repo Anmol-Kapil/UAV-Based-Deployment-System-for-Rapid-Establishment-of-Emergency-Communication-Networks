@@ -243,7 +243,9 @@ class BottomBar(QWidget):
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             alt = dlg.get_altitude()
-            self._dispatch("mock_takeoff", "send_takeoff", alt)
+            lat = app_state.uav_latitude
+            lon = app_state.uav_longitude
+            self._dispatch("mock_takeoff", "send_takeoff", alt, lat, lon)
 
     def _on_guided(self):
         self._dispatch("mock_guided", "send_guided")
