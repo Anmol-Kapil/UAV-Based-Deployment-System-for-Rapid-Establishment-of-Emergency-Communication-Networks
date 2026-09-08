@@ -49,16 +49,16 @@ class TestMavsdkIntegration(unittest.TestCase):
         self.assertEqual(normalize_mavsdk_address(""), "mock")
 
         # Port 14540 (PX4 SITL default companion/MAVSDK port)
-        self.assertEqual(normalize_mavsdk_address("14540"), "udpin://0.0.0.0:14540")
-        self.assertEqual(normalize_mavsdk_address("udp:127.0.0.1:14540"), "udpin://0.0.0.0:14540")
-        self.assertEqual(normalize_mavsdk_address("udp://127.0.0.1:14540"), "udpin://0.0.0.0:14540")
+        self.assertEqual(normalize_mavsdk_address("14540"), "udpin:0.0.0.0:14540")
+        self.assertEqual(normalize_mavsdk_address("udp:127.0.0.1:14540"), "udp:127.0.0.1:14540")
+        self.assertEqual(normalize_mavsdk_address("udp://127.0.0.1:14540"), "udp:127.0.0.1:14540")
 
         # Port 14550 (PX4 SITL GCS port)
-        self.assertEqual(normalize_mavsdk_address("udp:127.0.0.1:14550"), "udpin://0.0.0.0:14550")
-        self.assertEqual(normalize_mavsdk_address("udpin://0.0.0.0:14550"), "udpin://0.0.0.0:14550")
+        self.assertEqual(normalize_mavsdk_address("udp:127.0.0.1:14550"), "udp:127.0.0.1:14550")
+        self.assertEqual(normalize_mavsdk_address("udpin://0.0.0.0:14550"), "udpin:0.0.0.0:14550")
 
         # Serial / custom URLs
-        self.assertEqual(normalize_mavsdk_address("serial://COM3:57600"), "serial://COM3:57600")
+        self.assertEqual(normalize_mavsdk_address("serial://COM3:57600"), "serial:COM3:57600")
 
     def test_02_mavsdk_worker_lifecycle_and_signals(self):
         """Verify QMavsdkWorker lifecycle, mock stream, and Qt signal emissions."""
@@ -164,15 +164,15 @@ class TestMavsdkIntegration(unittest.TestCase):
         from gcs.widgets.connection_dialog import ConnectionDialog
         dlg = ConnectionDialog()
 
-        # Select MAVSDK PX4 SITL Companion (index 1)
+        # Select PX4 SITL 14550 GCS (index 1)
         dlg.combo_type.setCurrentIndex(1)
         conn_str, _ = dlg.get_connection_string()
-        self.assertEqual(conn_str, "udpin://0.0.0.0:14540")
+        self.assertEqual(conn_str, "udpin:0.0.0.0:14550")
 
-        # Select MAVSDK PX4 SITL GCS (index 2)
+        # Select PX4 SITL 14540 Companion (index 2)
         dlg.combo_type.setCurrentIndex(2)
         conn_str, _ = dlg.get_connection_string()
-        self.assertEqual(conn_str, "udpin://0.0.0.0:14550")
+        self.assertEqual(conn_str, "udpin:0.0.0.0:14540")
 
         # Select Mock (index 0)
         dlg.combo_type.setCurrentIndex(0)

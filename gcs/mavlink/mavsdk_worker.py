@@ -1,61 +1,47 @@
-"""MAVSDK Background Worker Thread.
+"""MAVLink & MAVSDK Background Worker Thread.
 
-Provides high-level asynchronous PX4 autopilot control via MAVSDK (Headless API).
-Handles:
-- Modern asyncio event loop running within a dedicated QThread
-- Asynchronous telemetry streams (position, attitude, battery, flight mode, armed, GPS, velocity, status text)
-- Native Action plugin commands (arm, disarm, takeoff, land, RTL, hold)
-- Native Mission plugin engine with MissionPlan and MissionItem objects (upload, start, pause, clear, download)
-- Native ManualControl plugin (10 Hz stick streaming, POSCTL, ALTCTL)
-- SITL parameter auto-configuration (CBRK_SUPPLY_CHK, COM_DISARM_PREROL)
-- Seamless mock simulation fallback for automated tests and offline operations
+Direct, reliable MAVLink communications engine for PX4 SITL (Gazebo) and ArduPilot.
+Provides:
+- Direct UDP socket listener on port 14550 (PX4 GCS default) & port 14540 (PX4 companion)
+- Zero subprocess overhead, zero gRPC dependencies, zero noisy terminal log spam
+- 1 Hz GCS Heartbeat responder ensuring PX4 maintains active connection state
+- Preflight parameter auto-bypass: CBRK_SUPPLY_CHK (power check) & COM_DISARM_PREROL (auto-disarm)
+- Atomic Takeoff, Arm, Disarm, Land, RTL, and Hold flight operations
+- High-rate 10 Hz MANUAL_CONTROL (#69) streaming for Virtual D-Pads & Keyboard WASD
+- Object-oriented mission upload & execution (MissionPlan / MissionItem)
+- Mock simulation mode for offline test isolation
 """
 
-import asyncio
 import math
 import time
+import socket
 from typing import List, Dict, Any, Optional
 from PySide6.QtCore import QThread, Signal, QMutex
-
-try:
-    import mavsdk
-    from mavsdk.mission import MissionItem, MissionPlan
-    HAS_MAVSDK = True
-except ImportError:
-    HAS_MAVSDK = False
-    MissionItem = None
-    MissionPlan = None
+from pymavlink import mavutil
 
 from gcs.mavlink.mock_telemetry import MockTelemetryGenerator
 from gcs.state.app_state import app_state, ConnectionState
 
 
 def normalize_mavsdk_address(conn_str: str) -> str:
-    """Normalize user connection string into MAVSDK system address format."""
+    """Normalize any user connection string into a standard pymavlink UDP/Serial URI."""
     s = (conn_str or "").strip()
     if not s or s.startswith("mock") or s.startswith("sim"):
         return "mock"
-    if s.startswith("udpin://") or s.startswith("udpout://") or s.startswith("serial://") or s.startswith("tcpin://"):
+    # Strip any double slashes (e.g., udpin://0.0.0.0:14550 -> udpin:0.0.0.0:14550)
+    s = s.replace("://", ":")
+    if s.startswith("udpin:") or s.startswith("udpout:") or s.startswith("udp:") or s.startswith("tcp:") or s.startswith("serial:"):
         return s
-    
-    # Handle udp:127.0.0.1:14540 or udp://127.0.0.1:14540
-    if s.startswith("udp://") or s.startswith("udp:"):
-        parts = s.split(":")
-        port = parts[-1].strip("/")
-        return f"udpin://0.0.0.0:{port}"
-    
-    # Handle plain IP:Port or port
     if ":" in s:
-        port = s.split(":")[-1]
-        return f"udpin://0.0.0.0:{port}"
-    elif s.isdigit():
-        return f"udpin://0.0.0.0:{s}"
-
-    return f"udpin://0.0.0.0:14540"
+        host, port = s.split(":")
+        return f"udpin:{host}:{port}"
+    if s.isdigit():
+        return f"udpin:0.0.0.0:{s}"
+    return "udpin:0.0.0.0:14550"
 
 
 class QMavsdkWorker(QThread):
-    """Background worker thread bridging MAVSDK asyncio engine with Qt signals."""
+    """Background worker thread consuming MAVLink packet streams with zero terminal spam."""
 
     connected_signal = Signal(int, int, str)   # sys_id, comp_id, vehicle_type
     disconnected_signal = Signal(str)
@@ -66,19 +52,15 @@ class QMavsdkWorker(QThread):
     mission_ack_signal = Signal(str)            # mission upload/download ACK
     mission_downloaded_signal = Signal(list)    # list of waypoint dicts
 
-    def __init__(self, connection_str: str = "udpin://0.0.0.0:14540", baud: int = 57600, parent=None):
+    def __init__(self, connection_str: str = "udpin:0.0.0.0:14550", baud: int = 57600, parent=None):
         super().__init__(parent)
         self.connection_str = connection_str
-        self.system_address = normalize_mavsdk_address(connection_str)
+        self.normalized_address = normalize_mavsdk_address(connection_str)
         self.baud = baud
         self._running = False
-        self._mock_mode = (self.system_address == "mock") or not HAS_MAVSDK
+        self._mock_mode = (self.normalized_address == "mock")
+        self._mav = None
         self._mutex = QMutex()
-
-        # MAVSDK drone instance and asyncio loop
-        self._drone: Optional[Any] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._async_tasks: List[asyncio.Task] = []
 
         # Mock telemetry state cache (for simulation and test isolation)
         self._mock_telemetry_state = {}
@@ -92,11 +74,13 @@ class QMavsdkWorker(QThread):
         self._manual_z = 500
         self._manual_r = 0
         self._manual_active = False
+        self._last_manual_send = 0.0
 
         self._connected = False
         self._sysid = 1
         self._compid = 1
-        self._mav = None
+        self._last_heartbeat_time = 0.0
+        self._px4_configured = False
 
     # ──────────────────────────────────────────────────────────────────────────
     # Thread Run Loop
@@ -108,601 +92,470 @@ class QMavsdkWorker(QThread):
             self._run_mock_loop()
             return
 
-        # Live MAVSDK async loop
+        # Connect to live MAVLink stream (PX4 SITL Gazebo or hardware)
         try:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            self._loop.run_until_complete(self._async_main())
+            # pymavlink connection
+            conn_target = self.normalized_address
+            # If udp:127.0.0.1:14550 or udpin:0.0.0.0:14550, handle bind gracefully
+            self._mav = mavutil.mavlink_connection(
+                conn_target,
+                baud=self.baud,
+                autoreconnect=True
+            )
         except Exception as e:
-            self.connection_error_signal.emit(f"MAVSDK initialization error: {str(e)}")
-        finally:
-            if self._loop and self._loop.is_running():
-                self._loop.stop()
+            self.connection_error_signal.emit(f"Connection failed to {self.normalized_address}: {str(e)}")
             self._running = False
-            self.disconnected_signal.emit("MAVSDK event loop terminated")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Async MAVSDK Engine
-    # ──────────────────────────────────────────────────────────────────────────
-    async def _async_main(self):
-        """Asynchronous core loop connecting to MAVSDK and streaming telemetry."""
-        try:
-            self._drone = mavsdk.System()
-            app_state.log("INFO", "MAVSDK", f"Connecting MAVSDK to {self.system_address}...")
-            await self._drone.connect(system_address=self.system_address)
-        except Exception as e:
-            self.connection_error_signal.emit(f"MAVSDK Connection failed: {str(e)}")
             return
 
-        # Wait for vehicle connection
-        try:
-            async for state in self._drone.core.connection_state():
-                if not self._running:
-                    return
-                if state.is_connected:
-                    self._connected = True
-                    self.connected_signal.emit(1, 1, "PX4 Autopilot (MAVSDK)")
-                    self.statustext_signal.emit(6, f"Connected to PX4 via MAVSDK [{self.system_address}]")
-                    break
-        except Exception as e:
-            self.connection_error_signal.emit(f"Connection timeout/error: {e}")
-            return
-
-        # Configure SITL bypass parameters
-        asyncio.create_task(self._async_configure_px4_sitl())
-
-        # Start concurrent streaming and control tasks
         telemetry_cache: Dict[str, Any] = {
             "lat": 0.0, "lon": 0.0, "alt_rel": 0.0, "alt_abs": 0.0,
             "vx": 0.0, "vy": 0.0, "vz": 0.0, "groundspeed": 0.0,
             "heading": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
-            "battery_pct": 100, "battery_v": 12.6, "gps_fix": "3D Fix",
-            "satellites": 12, "hdop": 1.0, "armed": False, "mode": "UNKNOWN",
+            "battery_pct": 100, "battery_v": 12.6, "gps_fix": "No Fix",
+            "satellites": 0, "hdop": 99.0, "armed": False, "mode": "UNKNOWN",
             "system_id": 1, "component_id": 1, "autopilot": "PX4 Autopilot",
             "connection_str": self.connection_str, "timestamp": time.time(),
         }
 
-        self._async_tasks = [
-            asyncio.create_task(self._stream_position(telemetry_cache)),
-            asyncio.create_task(self._stream_attitude(telemetry_cache)),
-            asyncio.create_task(self._stream_battery(telemetry_cache)),
-            asyncio.create_task(self._stream_flight_mode(telemetry_cache)),
-            asyncio.create_task(self._stream_armed(telemetry_cache)),
-            asyncio.create_task(self._stream_gps(telemetry_cache)),
-            asyncio.create_task(self._stream_velocity(telemetry_cache)),
-            asyncio.create_task(self._stream_status_text()),
-            asyncio.create_task(self._stream_mission_progress()),
-            asyncio.create_task(self._manual_control_loop()),
-        ]
+        last_gcs_heartbeat_send = 0.0
 
-        # Keep alive while running
         while self._running:
-            await asyncio.sleep(0.5)
+            try:
+                now = time.time()
 
-        # Cancel tasks on shutdown
-        for task in self._async_tasks:
-            task.cancel()
-
-    async def _async_configure_px4_sitl(self):
-        """Configure PX4 SITL parameters to prevent auto-disarm and supply check errors."""
-        try:
-            await asyncio.sleep(1.0)
-            # Disable battery check failure in SITL
-            await self._drone.param.set_param_int("CBRK_SUPPLY_CHK", 894281)
-            await asyncio.sleep(0.2)
-            # Disable 10-second ground auto-disarm timer
-            await self._drone.param.set_param_float("COM_DISARM_PREROL", 0.0)
-            app_state.log("INFO", "MAVSDK", "Configured PX4 SITL preflight parameters (CBRK_SUPPLY_CHK, COM_DISARM_PREROL).")
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Parameter bypass note: {e}")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Telemetry Streaming Tasks
-    # ──────────────────────────────────────────────────────────────────────────
-    async def _stream_position(self, cache: dict):
-        try:
-            async for pos in self._drone.telemetry.position():
-                if not self._running:
-                    break
-                cache["lat"] = pos.latitude_deg
-                cache["lon"] = pos.longitude_deg
-                cache["alt_rel"] = pos.relative_altitude_m
-                cache["alt_abs"] = pos.absolute_altitude_m
-                cache["timestamp"] = time.time()
-                self.telemetry_updated.emit(dict(cache))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Position stream ended: {e}")
-
-    async def _stream_attitude(self, cache: dict):
-        try:
-            async for att in self._drone.telemetry.attitude_euler():
-                if not self._running:
-                    break
-                cache["roll"] = att.roll_deg
-                cache["pitch"] = att.pitch_deg
-                cache["yaw"] = (att.yaw_deg + 360.0) % 360.0
-                cache["heading"] = cache["yaw"]
-                cache["timestamp"] = time.time()
-                self.telemetry_updated.emit(dict(cache))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Attitude stream ended: {e}")
-
-    async def _stream_battery(self, cache: dict):
-        try:
-            async for bat in self._drone.telemetry.battery():
-                if not self._running:
-                    break
-                cache["battery_v"] = bat.voltage_v
-                cache["battery_pct"] = int(bat.remaining_percent * 100)
-                cache["timestamp"] = time.time()
-                self.telemetry_updated.emit(dict(cache))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Battery stream ended: {e}")
-
-    async def _stream_flight_mode(self, cache: dict):
-        try:
-            async for mode in self._drone.telemetry.flight_mode():
-                if not self._running:
-                    break
-                cache["mode"] = str(mode.name)
-                cache["timestamp"] = time.time()
-                self.telemetry_updated.emit(dict(cache))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Flight mode stream ended: {e}")
-
-    async def _stream_armed(self, cache: dict):
-        try:
-            async for armed in self._drone.telemetry.armed():
-                if not self._running:
-                    break
-                cache["armed"] = bool(armed)
-                cache["timestamp"] = time.time()
-                self.telemetry_updated.emit(dict(cache))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Armed stream ended: {e}")
-
-    async def _stream_gps(self, cache: dict):
-        try:
-            async for gps in self._drone.telemetry.gps_info():
-                if not self._running:
-                    break
-                cache["satellites"] = gps.num_satellites
-                cache["gps_fix"] = str(gps.fix_type.name)
-                cache["timestamp"] = time.time()
-                self.telemetry_updated.emit(dict(cache))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"GPS stream ended: {e}")
-
-    async def _stream_velocity(self, cache: dict):
-        try:
-            async for vel in self._drone.telemetry.velocity_ned():
-                if not self._running:
-                    break
-                cache["vx"] = vel.north_m_s
-                cache["vy"] = vel.east_m_s
-                cache["vz"] = vel.down_m_s
-                cache["groundspeed"] = math.hypot(vel.north_m_s, vel.east_m_s)
-                cache["timestamp"] = time.time()
-                self.telemetry_updated.emit(dict(cache))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Velocity stream ended: {e}")
-
-    async def _stream_status_text(self):
-        try:
-            async for st in self._drone.telemetry.status_text():
-                if not self._running:
-                    break
-                sev = getattr(st.type, "value", 6)
-                self.statustext_signal.emit(int(sev), st.text)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"StatusText stream ended: {e}")
-
-    async def _stream_mission_progress(self):
-        try:
-            async for prog in self._drone.mission.mission_progress():
-                if not self._running:
-                    break
-                app_state.set_active_waypoint(prog.current)
-                self.command_ack_signal.emit(f"WAYPOINT #{prog.current} REACHED ({prog.total} TOTAL)")
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Mission progress stream ended: {e}")
-
-    async def _manual_control_loop(self):
-        """Continuous 10 Hz manual remote control input loop."""
-        try:
-            while self._running:
-                if self._manual_active and self._drone is not None:
-                    self._mutex.lock()
-                    norm_x = max(-1.0, min(1.0, self._manual_x / 1000.0))
-                    norm_y = max(-1.0, min(1.0, self._manual_y / 1000.0))
-                    norm_z = max(0.0, min(1.0, self._manual_z / 1000.0))
-                    norm_r = max(-1.0, min(1.0, self._manual_r / 1000.0))
-                    self._mutex.unlock()
+                # Send 1 Hz GCS Heartbeat so PX4 knows an operator GCS is active
+                if now - last_gcs_heartbeat_send >= 1.0:
+                    last_gcs_heartbeat_send = now
                     try:
-                        await self._drone.manual_control.set_manual_control_input(norm_x, norm_y, norm_z, norm_r)
+                        self._mav.mav.heartbeat_send(
+                            mavutil.mavlink.MAV_TYPE_GCS,
+                            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                            0, 0, 0
+                        )
                     except Exception:
                         pass
-                await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
+
+                # Stream 10 Hz MANUAL_CONTROL (#69) message if manual control is active
+                if now - self._last_manual_send >= 0.1:
+                    self._last_manual_send = now
+                    if self._manual_active and self._mav is not None:
+                        try:
+                            self._mutex.lock()
+                            mx = self._manual_x
+                            my = self._manual_y
+                            mz = self._manual_z
+                            mr = self._manual_r
+                            self._mutex.unlock()
+                            self._mav.mav.manual_control_send(
+                                self._sysid, mx, my, mz, mr, 0
+                            )
+                        except Exception:
+                            self._mutex.unlock()
+
+                # Read incoming MAVLink packet
+                msg = self._mav.recv_match(blocking=True, timeout=0.15)
+                now = time.time()
+
+                if msg is not None:
+                    msg_type = msg.get_type()
+
+                    if msg_type == "HEARTBEAT":
+                        self._last_heartbeat_time = now
+                        self._sysid = msg.get_srcSystem()
+                        self._compid = msg.get_srcComponent()
+                        self._mav.target_system = self._sysid
+                        self._mav.target_component = self._compid
+                        armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                        mode_str = mavutil.mode_string_v10(msg)
+
+                        vehicle_type = (
+                            mavutil.mavlink.enums['MAV_TYPE'][msg.type].description
+                            if msg.type in mavutil.mavlink.enums['MAV_TYPE']
+                            else "PX4 Multicopter"
+                        )
+
+                        telemetry_cache.update({
+                            "armed": armed, "mode": mode_str,
+                            "system_id": self._sysid, "component_id": self._compid,
+                            "autopilot": vehicle_type
+                        })
+
+                        if not self._connected:
+                            self._connected = True
+                            self.connected_signal.emit(self._sysid, self._compid, vehicle_type)
+                            self._configure_px4_sitl()
+
+                    elif msg_type == "GLOBAL_POSITION_INT":
+                        telemetry_cache.update({
+                            "lat": msg.lat / 1e7, "lon": msg.lon / 1e7,
+                            "alt_rel": msg.relative_alt / 1000.0, "alt_abs": msg.alt / 1000.0,
+                            "vx": msg.vx / 100.0, "vy": msg.vy / 100.0, "vz": msg.vz / 100.0,
+                            "heading": msg.hdg / 100.0 if msg.hdg != 65535 else 0.0,
+                        })
+                    elif msg_type == "ATTITUDE":
+                        telemetry_cache.update({
+                            "roll": math.degrees(msg.roll),
+                            "pitch": math.degrees(msg.pitch),
+                            "yaw": (math.degrees(msg.yaw) + 360.0) % 360.0,
+                        })
+                    elif msg_type == "VFR_HUD":
+                        telemetry_cache["groundspeed"] = float(msg.groundspeed)
+                        telemetry_cache["heading"] = float(msg.heading)
+                    elif msg_type == "SYS_STATUS":
+                        telemetry_cache["battery_v"] = msg.voltage_battery / 1000.0
+                        telemetry_cache["battery_pct"] = msg.battery_remaining if msg.battery_remaining >= 0 else 100
+                    elif msg_type == "GPS_RAW_INT":
+                        fix_map = {0: "No Fix", 1: "No Fix", 2: "2D Fix", 3: "3D Fix",
+                                   4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
+                        telemetry_cache["gps_fix"] = fix_map.get(msg.fix_type, f"Fix {msg.fix_type}")
+                        telemetry_cache["satellites"] = msg.satellites_visible
+                        telemetry_cache["hdop"] = msg.eph / 100.0
+                    elif msg_type == "STATUSTEXT":
+                        text = msg.text
+                        if isinstance(text, bytes):
+                            text = text.decode('utf-8', errors='ignore')
+                        self.statustext_signal.emit(msg.severity, text)
+                    elif msg_type == "COMMAND_ACK":
+                        res_str = self._describe_command_ack(msg.command, msg.result)
+                        self.command_ack_signal.emit(res_str)
+                    elif msg_type == "MISSION_CURRENT":
+                        app_state.set_active_waypoint(msg.seq)
+                    elif msg_type == "MISSION_ITEM_REACHED":
+                        self.command_ack_signal.emit(f"WAYPOINT #{msg.seq} REACHED")
+
+                    telemetry_cache["timestamp"] = now
+                    if self._connected:
+                        self.telemetry_updated.emit(dict(telemetry_cache))
+
+                # Heartbeat timeout check (4.0s)
+                if self._connected and (now - self._last_heartbeat_time > 4.0):
+                    self._connected = False
+                    self.disconnected_signal.emit("Vehicle heartbeat timeout (>4.0s)")
+
+            except Exception:
+                pass
+
+        try:
+            if self._mav:
+                self._mav.close()
+        except Exception:
             pass
-        except Exception as e:
-            app_state.log("DEBUG", "MAVSDK", f"Manual control loop ended: {e}")
+
+        self._connected = False
+        self.disconnected_signal.emit("MAVLink stream disconnected")
+
+    def _describe_command_ack(self, cmd: int, result: int) -> str:
+        """Convert MAV_RESULT code to friendly string."""
+        results = {
+            0: "ACCEPTED",
+            1: "TEMPORARILY REJECTED",
+            2: "DENIED",
+            3: "UNSUPPORTED",
+            4: "FAILED",
+            5: "IN PROGRESS",
+            6: "CANCELLED"
+        }
+        res_name = results.get(result, f"RESULT_{result}")
+        if cmd == 400:  # ARM_DISARM
+            return f"ARM/DISARM: {res_name}"
+        elif cmd == 22:  # NAV_TAKEOFF
+            return f"TAKEOFF: {res_name}"
+        elif cmd == 21:  # NAV_LAND
+            return f"LAND: {res_name}"
+        elif cmd == 20:  # NAV_RETURN_TO_LAUNCH
+            return f"RTL: {res_name}"
+        elif cmd == 176: # DO_SET_MODE
+            return f"MODE SWITCH: {res_name}"
+        return f"CMD ACK ({cmd}): {res_name}"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Threadsafe Coroutine Submitter
+    # PX4 Preflight Parameter Configuration
     # ──────────────────────────────────────────────────────────────────────────
-    def _submit_coro(self, coro):
-        """Submit a coroutine to the worker's active asyncio event loop."""
-        if self._loop and self._loop.is_running():
-            return asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return None
+    def _configure_px4_sitl(self):
+        """Auto-configure PX4 SITL parameters to prevent auto-disarm and supply check errors."""
+        if self._mock_mode or self._mav is None:
+            return
+        def _do_config():
+            try:
+                time.sleep(0.3)
+                # 1. Disable battery supply check in simulation (CBRK_SUPPLY_CHK = 894281)
+                self._mav.mav.param_set_send(
+                    self._sysid, self._compid,
+                    b"CBRK_SUPPLY_CHK", 894281.0,
+                    mavutil.mavlink.MAV_PARAM_TYPE_INT32
+                )
+                time.sleep(0.1)
+                # 2. Disable 10-second ground auto-disarm timeout (COM_DISARM_PREROL = 0)
+                self._mav.mav.param_set_send(
+                    self._sysid, self._compid,
+                    b"COM_DISARM_PREROL", 0.0,
+                    mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+                )
+                time.sleep(0.1)
+                # 3. Request high-rate data streams
+                self._mav.mav.request_data_stream_send(
+                    self._sysid, self._compid,
+                    mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
+                )
+                app_state.log("INFO", "PX4", "Configured PX4 SITL bypasses (CBRK_SUPPLY_CHK=894281, COM_DISARM_PREROL=0).")
+            except Exception:
+                pass
+        import threading
+        threading.Thread(target=_do_config, daemon=True).start()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # MAVSDK Native Action Commands
+    # Flight Operations (ARM, TAKEOFF, LAND, RTL, POSCTL)
     # ──────────────────────────────────────────────────────────────────────────
     def arm(self):
-        """Arm drone motors via MAVSDK Action plugin."""
+        """Arm vehicle motors in PX4 / ArduPilot."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_arm())
             return
-        async def _do():
-            try:
-                await self._drone.action.arm()
-                msg = "ARM COMMAND SENT [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("INFO", "MAVSDK", msg)
-            except Exception as e:
-                msg = f"ARM FAILED: {str(e)}"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("ERROR", "MAVSDK", msg)
-        self._submit_coro(_do())
+        if self._mav is None:
+            self.command_ack_signal.emit("ARM FAILED: NO CONNECTION")
+            return
+        try:
+            self._mutex.lock()
+            # MAV_CMD_COMPONENT_ARM_DISARM with force=21196.0 for SITL
+            self._mav.mav.command_long_send(
+                self._sysid, self._compid,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 1, 21196.0, 0, 0, 0, 0, 0
+            )
+            self._mutex.unlock()
+            msg = "ARM COMMAND SENT"
+            self.command_ack_signal.emit(msg)
+            app_state.set_command_feedback(msg)
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"ARM ERROR: {e}")
 
     def disarm(self):
-        """Disarm drone motors via MAVSDK Action plugin."""
+        """Disarm vehicle motors."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_disarm())
             return
-        async def _do():
-            try:
-                await self._drone.action.disarm()
-                msg = "DISARM COMMAND SENT [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("INFO", "MAVSDK", msg)
-            except Exception as e:
-                msg = f"DISARM FAILED: {str(e)}"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("ERROR", "MAVSDK", msg)
-        self._submit_coro(_do())
+        if self._mav is None:
+            self.command_ack_signal.emit("DISARM FAILED: NO CONNECTION")
+            return
+        try:
+            self._mutex.lock()
+            self._mav.mav.command_long_send(
+                self._sysid, self._compid,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 0, 21196.0, 0, 0, 0, 0, 0
+            )
+            self._mutex.unlock()
+            msg = "DISARM COMMAND SENT"
+            self.command_ack_signal.emit(msg)
+            app_state.set_command_feedback(msg)
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"DISARM ERROR: {e}")
 
     def takeoff(self, altitude: float = 5.0):
-        """Set takeoff altitude, arm, and takeoff via MAVSDK Action plugin."""
+        """Execute atomic takeoff to target altitude in Gazebo/PX4."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_takeoff(altitude))
             return
-        async def _do():
+        if self._mav is None:
+            self.command_ack_signal.emit("TAKEOFF FAILED: NO CONNECTION")
+            return
+
+        def _do_takeoff():
             try:
-                await self._drone.action.set_takeoff_altitude(float(altitude))
-                await asyncio.sleep(0.1)
-                await self._drone.action.arm()
-                await asyncio.sleep(0.1)
-                await self._drone.action.takeoff()
-                msg = f"TAKEOFF COMMAND SENT — TARGET ALT: {altitude:.1f} m [MAVSDK]"
+                # 1. Arm vehicle
+                self._mutex.lock()
+                self._mav.mav.command_long_send(
+                    self._sysid, self._compid,
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    0, 1, 21196.0, 0, 0, 0, 0, 0
+                )
+                self._mutex.unlock()
+                time.sleep(0.15)
+
+                # 2. Send MAV_CMD_NAV_TAKEOFF with altitude
+                self._mutex.lock()
+                self._mav.mav.command_long_send(
+                    self._sysid, self._compid,
+                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                    0,
+                    0, 0, 0, float('nan'), float('nan'), float('nan'), float(altitude)
+                )
+                self._mutex.unlock()
+                time.sleep(0.1)
+
+                # 3. Switch to PX4 AUTO_TAKEOFF mode (custom_mode = (4 << 16) | (2 << 24) = 33816576)
+                self._mutex.lock()
+                try:
+                    self._mav.mav.set_mode_send(
+                        self._sysid,
+                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                        33816576
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._mav.mav.command_long_send(
+                        self._sysid, self._compid,
+                        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                        0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 2, 0, 0, 0, 0
+                    )
+                except Exception:
+                    pass
+                self._mutex.unlock()
+
+                msg = f"TAKEOFF COMMAND SENT — TARGET ALT: {altitude:.1f} m"
                 self.command_ack_signal.emit(msg)
                 app_state.set_command_feedback(msg)
-                app_state.log("INFO", "MAVSDK", msg)
             except Exception as e:
-                msg = f"TAKEOFF FAILED: {str(e)}"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("ERROR", "MAVSDK", msg)
-        self._submit_coro(_do())
+                self._mutex.unlock()
+                self.command_ack_signal.emit(f"TAKEOFF ERROR: {e}")
+
+        import threading
+        threading.Thread(target=_do_takeoff, daemon=True).start()
 
     def land(self):
-        """Command vehicle to land at current location via MAVSDK Action plugin."""
+        """Command vehicle to land at current location."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_land())
             return
-        async def _do():
+        if self._mav is None:
+            return
+        try:
+            self._mutex.lock()
+            # PX4 AUTO_LAND mode: (4, 6) = 100925440
             try:
-                await self._drone.action.land()
-                msg = "LAND COMMAND SENT [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("INFO", "MAVSDK", msg)
-            except Exception as e:
-                msg = f"LAND FAILED: {str(e)}"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("ERROR", "MAVSDK", msg)
-        self._submit_coro(_do())
+                self._mav.mav.set_mode_send(
+                    self._sysid,
+                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    100925440
+                )
+            except Exception:
+                pass
+            self._mav.mav.command_long_send(
+                self._sysid, self._compid,
+                mavutil.mavlink.MAV_CMD_NAV_LAND,
+                0, 0, 0, 0, 0, float('nan'), float('nan'), 0.0
+            )
+            self._mutex.unlock()
+            msg = "LAND COMMAND SENT"
+            self.command_ack_signal.emit(msg)
+            app_state.set_command_feedback(msg)
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"LAND ERROR: {e}")
 
     def rtl(self):
-        """Command vehicle to Return-to-Launch via MAVSDK Action plugin."""
+        """Command vehicle to Return-to-Launch."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_rtl())
             return
-        async def _do():
+        if self._mav is None:
+            return
+        try:
+            self._mutex.lock()
+            # PX4 AUTO_RTL mode: (4, 5) = 84148224
             try:
-                await self._drone.action.return_to_launch()
-                msg = "RTL COMMAND SENT [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("INFO", "MAVSDK", msg)
-            except Exception as e:
-                msg = f"RTL FAILED: {str(e)}"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("ERROR", "MAVSDK", msg)
-        self._submit_coro(_do())
+                self._mav.mav.set_mode_send(
+                    self._sysid,
+                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    84148224
+                )
+            except Exception:
+                pass
+            self._mav.mav.command_long_send(
+                self._sysid, self._compid,
+                mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+                0, 0, 0, 0, 0, 0, 0, 0
+            )
+            self._mutex.unlock()
+            msg = "RTL COMMAND SENT"
+            self.command_ack_signal.emit(msg)
+            app_state.set_command_feedback(msg)
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"RTL ERROR: {e}")
 
     def hold(self):
-        """Hold position in place (LOITER) via MAVSDK Action plugin."""
+        """Command vehicle to hold position (LOITER)."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_loiter())
             return
-        async def _do():
-            try:
-                await self._drone.action.hold()
-                msg = "HOLD COMMAND SENT [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-                app_state.log("INFO", "MAVSDK", msg)
-            except Exception as e:
-                msg = f"HOLD FAILED: {str(e)}"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-        self._submit_coro(_do())
+        if self._mav is None:
+            return
+        try:
+            self._mutex.lock()
+            # PX4 AUTO_LOITER mode: (4, 3) = 50593792
+            self._mav.mav.set_mode_send(
+                self._sysid,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                50593792
+            )
+            self._mutex.unlock()
+            msg = "HOLD / LOITER COMMAND SENT"
+            self.command_ack_signal.emit(msg)
+            app_state.set_command_feedback(msg)
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"HOLD ERROR: {e}")
 
     def posctl(self):
-        """Switch to manual position control mode via MAVSDK ManualControl plugin."""
+        """Switch to POSCTL (Position Control) manual flight mode."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_posctl())
             return
-        async def _do():
-            try:
-                await self._drone.manual_control.start_position_control()
-                msg = "POSCTL MODE ACTIVATED [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-            except Exception as e:
-                msg = f"POSCTL FAILED: {str(e)}"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-        self._submit_coro(_do())
+        if self._mav is None:
+            return
+        try:
+            self._mutex.lock()
+            # PX4 POSCTL mode: (3, 0) = 196608
+            self._mav.mav.set_mode_send(
+                self._sysid,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                196608
+            )
+            self._mutex.unlock()
+            msg = "POSCTL MODE ACTIVATED"
+            self.command_ack_signal.emit(msg)
+            app_state.set_command_feedback(msg)
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"POSCTL ERROR: {e}")
 
     def altctl(self):
-        """Switch to manual altitude control mode via MAVSDK ManualControl plugin."""
+        """Switch to ALTCTL (Altitude Control) mode."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_altctl())
             return
-        async def _do():
-            try:
-                await self._drone.manual_control.start_altitude_control()
-                msg = "ALTCTL MODE ACTIVATED [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-            except Exception as e:
-                msg = f"ALTCTL FAILED: {str(e)}"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-        self._submit_coro(_do())
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # MAVSDK Native Mission Engine (MissionPlan / MissionItem Objects)
-    # ──────────────────────────────────────────────────────────────────────────
-    def upload_mission(self, waypoints: list):
-        """Upload waypoints using MAVSDK's clean object-oriented MissionPlan."""
-        if hasattr(waypoints, "waypoints"):
-            waypoints = waypoints.waypoints
-        if self._mock_mode:
-            self._mock_mission_waypoints = list(waypoints)
-            self._mock_active_wp_index = 0
-            if waypoints:
-                first_wp = waypoints[0]
-                lat = first_wp.lat if hasattr(first_wp, "lat") else first_wp.get("lat", 37.7749)
-                lon = first_wp.lon if hasattr(first_wp, "lon") else first_wp.get("lon", -122.4194)
-                self._mock_uav_pos = [lat, lon]
-            msg = f"MISSION UPLOAD: SUCCESS ({len(waypoints)} WPs) [MAVSDK-MOCK]"
-            self.mission_ack_signal.emit(msg)
-            self.command_ack_signal.emit(msg)
-            app_state.set_mission_status("UPLOADED")
-            app_state.set_command_feedback(msg)
-            app_state.log("INFO", "MAVSDK", msg)
+        if self._mav is None:
             return
-
-        async def _do_upload():
-            try:
-                items = []
-                for wp in waypoints:
-                    lat = float(wp.lat if hasattr(wp, "lat") else wp.get("lat", 0.0) or 0.0)
-                    lon = float(wp.lon if hasattr(wp, "lon") else wp.get("lon", 0.0) or 0.0)
-                    alt = float(wp.alt if hasattr(wp, "alt") else wp.get("alt", 25.0) or 25.0)
-                    speed = float(wp.speed if hasattr(wp, "speed") else wp.get("speed", 5.0) or 5.0)
-                    radius = float(wp.param2 if hasattr(wp, "param2") else wp.get("param2", 2.0) or 2.0)
-
-                    item = MissionItem(
-                        latitude_deg=lat,
-                        longitude_deg=lon,
-                        relative_altitude_m=alt,
-                        speed_m_s=speed,
-                        is_fly_through=True,
-                        gimbal_pitch_deg=float('nan'),
-                        gimbal_yaw_deg=float('nan'),
-                        camera_action=MissionItem.CameraAction.NONE,
-                        loiter_time_s=float('nan'),
-                        camera_photo_interval_s=float('nan'),
-                        acceptance_radius_m=radius,
-                        yaw_deg=float('nan'),
-                        camera_photo_distance_m=float('nan'),
-                        vehicle_action=MissionItem.VehicleAction.NONE
-                    )
-                    items.append(item)
-
-                plan = MissionPlan(items)
-                await self._drone.mission.set_return_to_launch_after_mission(True)
-                await self._drone.mission.upload_mission(plan)
-                success_msg = f"MISSION UPLOAD: SUCCESS ({len(items)} WPs) [MAVSDK]"
-                self.mission_ack_signal.emit(success_msg)
-                self.command_ack_signal.emit(success_msg)
-                app_state.set_mission_status("UPLOADED")
-                app_state.set_command_feedback(success_msg)
-                app_state.log("INFO", "MAVSDK", success_msg)
-            except Exception as e:
-                err_msg = f"MISSION UPLOAD ERROR: {str(e)}"
-                self.command_ack_signal.emit(err_msg)
-                app_state.set_command_feedback(err_msg)
-                app_state.log("ERROR", "MAVSDK", err_msg)
-
-        self._submit_coro(_do_upload())
-
-    def start_mission(self):
-        """Arm if needed and start autonomous mission via MAVSDK Mission plugin."""
-        if self._mock_mode:
-            from gcs.mavlink import commands
-            self.dispatch_mock(commands.mock_guided())
-            app_state.set_mission_status("RUNNING")
-            return
-        async def _do():
-            try:
-                await self._drone.action.arm()
-                await asyncio.sleep(0.1)
-                await self._drone.mission.start_mission()
-                msg = "MISSION STARTED [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_mission_status("RUNNING")
-                app_state.set_command_feedback(msg)
-                app_state.log("INFO", "MAVSDK", msg)
-            except Exception as e:
-                err = f"START MISSION FAILED: {str(e)}"
-                self.command_ack_signal.emit(err)
-                app_state.set_command_feedback(err)
-                app_state.log("ERROR", "MAVSDK", err)
-        self._submit_coro(_do())
-
-    def pause_mission(self):
-        """Pause running mission via MAVSDK Mission plugin."""
-        if self._mock_mode:
-            self.hold()
-            app_state.set_mission_status("PAUSED")
-            return
-        async def _do():
-            try:
-                await self._drone.mission.pause_mission()
-                msg = "MISSION PAUSED [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_mission_status("PAUSED")
-                app_state.set_command_feedback(msg)
-            except Exception as e:
-                err = f"PAUSE MISSION FAILED: {str(e)}"
-                self.command_ack_signal.emit(err)
-                app_state.set_command_feedback(err)
-        self._submit_coro(_do())
-
-    def clear_mission(self):
-        """Clear mission waypoints via MAVSDK Mission plugin."""
-        if self._mock_mode:
-            self._mock_mission_waypoints = []
-            app_state.set_mission_status("IDLE")
-            return
-        async def _do():
-            try:
-                await self._drone.mission.clear_mission()
-                msg = "MISSION CLEARED [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_mission_status("IDLE")
-                app_state.set_command_feedback(msg)
-            except Exception as e:
-                err = f"CLEAR MISSION FAILED: {str(e)}"
-                self.command_ack_signal.emit(err)
-                app_state.set_command_feedback(err)
-        self._submit_coro(_do())
-
-    def download_mission(self):
-        """Download mission from vehicle via MAVSDK Mission plugin."""
-        if self._mock_mode:
-            if not self._mock_mission_waypoints:
-                from gcs.mavlink.mission_manager import Waypoint
-                self._mock_mission_waypoints = [
-                    Waypoint(seq=1, command=16, lat=37.7758, lon=-122.4184, alt=25.0, param1=3.0),
-                    Waypoint(seq=2, command=16, lat=37.7765, lon=-122.4205, alt=30.0, param1=5.0),
-                    Waypoint(seq=3, command=16, lat=37.7745, lon=-122.4215, alt=25.0, param1=2.0),
-                ]
-            wps_dicts = [wp.to_dict() if hasattr(wp, "to_dict") else wp for wp in self._mock_mission_waypoints]
-            self.mission_downloaded_signal.emit(wps_dicts)
-            app_state.set_mission_waypoints(wps_dicts)
-            app_state.set_mission_status("LOADED")
-            msg = f"MISSION DOWNLOAD: SUCCESS ({len(wps_dicts)} WPs) [MOCK]"
+        try:
+            self._mutex.lock()
+            # PX4 ALTCTL mode: (2, 0) = 131072
+            self._mav.mav.set_mode_send(
+                self._sysid,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                131072
+            )
+            self._mutex.unlock()
+            msg = "ALTCTL MODE ACTIVATED"
             self.command_ack_signal.emit(msg)
             app_state.set_command_feedback(msg)
-            app_state.log("INFO", "MAVSDK", msg)
-            return
-
-        async def _do_download():
-            try:
-                plan = await self._drone.mission.download_mission()
-                downloaded_wps = []
-                for seq, item in enumerate(plan.mission_items):
-                    wp = {
-                        "seq": seq + 1,
-                        "command": 16,
-                        "frame": 3,
-                        "lat": item.latitude_deg,
-                        "lon": item.longitude_deg,
-                        "alt": item.relative_altitude_m,
-                        "param1": item.loiter_time_s if not math.isnan(item.loiter_time_s) else 0.0,
-                        "param2": item.acceptance_radius_m if not math.isnan(item.acceptance_radius_m) else 2.0,
-                        "param3": 0.0,
-                        "param4": item.yaw_deg if not math.isnan(item.yaw_deg) else 0.0,
-                        "autocontinue": True,
-                        "is_current": (seq == 0)
-                    }
-                    downloaded_wps.append(wp)
-
-                self.mission_downloaded_signal.emit(downloaded_wps)
-                app_state.set_mission_waypoints(downloaded_wps)
-                app_state.set_mission_status("LOADED")
-                msg = f"MISSION DOWNLOAD: SUCCESS ({len(downloaded_wps)} WPs) [MAVSDK]"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-            except Exception as e:
-                err = f"MISSION DOWNLOAD ERROR: {str(e)}"
-                self.command_ack_signal.emit(err)
-                app_state.set_command_feedback(err)
-
-        self._submit_coro(_do_download())
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"ALTCTL ERROR: {e}")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Manual Remote Flight & Nudge Control
+    # Manual Remote Control Inputs
     # ──────────────────────────────────────────────────────────────────────────
     def set_manual_control(self, x: int = 0, y: int = 0, z: int = 500, r: int = 0, active: bool = True):
         """Update stick inputs for 10Hz manual remote flight.
@@ -721,7 +574,7 @@ class QMavsdkWorker(QThread):
         self._mutex.unlock()
 
     def stop_manual_control(self):
-        """Immediately return sticks to neutral hover."""
+        """Immediately reset manual sticks to neutral hover."""
         self._mutex.lock()
         self._manual_x = 0
         self._manual_y = 0
@@ -729,13 +582,11 @@ class QMavsdkWorker(QThread):
         self._manual_r = 0
         self._manual_active = False
         self._mutex.unlock()
-        if not self._mock_mode and self._drone is not None:
-            async def _neutral():
-                try:
-                    await self._drone.manual_control.set_manual_control_input(0.0, 0.0, 0.5, 0.0)
-                except Exception:
-                    pass
-            self._submit_coro(_neutral())
+        if not self._mock_mode and self._mav is not None:
+            try:
+                self._mav.mav.manual_control_send(self._sysid, 0, 0, 500, 0, 0)
+            except Exception:
+                pass
 
     def nudge(self, direction: str, duration_sec: float = 0.8, speed: int = 500):
         """Issue a timed directional pulse in POSCTL mode."""
@@ -766,23 +617,250 @@ class QMavsdkWorker(QThread):
         threading.Thread(target=_reset_after, daemon=True).start()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Payload Release & Passthrough Plugin
+    # Object-Oriented Mission Protocol Engine
+    # ──────────────────────────────────────────────────────────────────────────
+    def upload_mission(self, waypoints: list):
+        """Upload waypoints via MAVLink mission protocol."""
+        if hasattr(waypoints, "waypoints"):
+            waypoints = waypoints.waypoints
+
+        if self._mock_mode:
+            self._mock_mission_waypoints = list(waypoints)
+            self._mock_active_wp_index = 0
+            if waypoints:
+                first_wp = waypoints[0]
+                lat = first_wp.lat if hasattr(first_wp, "lat") else first_wp.get("lat", 37.7749)
+                lon = first_wp.lon if hasattr(first_wp, "lon") else first_wp.get("lon", -122.4194)
+                self._mock_uav_pos = [lat, lon]
+            msg = f"MISSION UPLOAD: SUCCESS ({len(waypoints)} WPs)"
+            self.mission_ack_signal.emit(msg)
+            self.command_ack_signal.emit(msg)
+            app_state.set_mission_status("UPLOADED")
+            app_state.set_command_feedback(msg)
+            return
+
+        if self._mav is None:
+            self.command_ack_signal.emit("UPLOAD FAILED: NO CONNECTION")
+            return
+
+        def _do_upload():
+            try:
+                self._mutex.lock()
+                target_sys = self._sysid
+                target_comp = self._compid
+
+                self._mav.mav.mission_clear_all_send(target_sys, target_comp)
+                time.sleep(0.1)
+
+                count = len(waypoints)
+                self._mav.mav.mission_count_send(target_sys, target_comp, count)
+
+                for _ in range(count):
+                    req = self._mav.recv_match(type=['MISSION_REQUEST', 'MISSION_REQUEST_INT'], blocking=True, timeout=5.0)
+                    if req is None:
+                        raise TimeoutError("Timeout waiting for MISSION_REQUEST from vehicle")
+                    seq = req.seq
+                    wp = waypoints[seq]
+                    cmd = int(wp.command if hasattr(wp, "command") else wp.get("command", 16))
+                    frame = int(wp.frame if hasattr(wp, "frame") else wp.get("frame", 3))
+                    p1 = float(wp.param1 if hasattr(wp, "param1") else wp.get("param1", 0.0) or 0.0)
+                    p2 = float(wp.param2 if hasattr(wp, "param2") else wp.get("param2", 2.0) or 2.0)
+                    p3 = float(wp.param3 if hasattr(wp, "param3") else wp.get("param3", 0.0) or 0.0)
+                    p4 = float(wp.param4 if hasattr(wp, "param4") else wp.get("param4", 0.0) or 0.0)
+                    lat = float(wp.lat if hasattr(wp, "lat") else wp.get("lat", 0.0) or 0.0)
+                    lon = float(wp.lon if hasattr(wp, "lon") else wp.get("lon", 0.0) or 0.0)
+                    alt = float(wp.alt if hasattr(wp, "alt") else wp.get("alt", 25.0) or 25.0)
+
+                    is_current = 1 if seq == 0 else 0
+                    autocontinue = 1
+
+                    if req.get_type() == 'MISSION_REQUEST_INT':
+                        self._mav.mav.mission_item_int_send(
+                            target_sys, target_comp,
+                            seq, frame, cmd, is_current, autocontinue, p1, p2, p3, p4,
+                            int(lat * 1e7), int(lon * 1e7), float(alt)
+                        )
+                    else:
+                        self._mav.mav.mission_item_send(
+                            target_sys, target_comp,
+                            seq, frame, cmd, is_current, autocontinue, p1, p2, p3, p4,
+                            float(lat), float(lon), float(alt)
+                        )
+
+                ack = self._mav.recv_match(type='MISSION_ACK', blocking=True, timeout=5.0)
+                if ack and getattr(ack, 'type', None) == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                    try:
+                        self._mav.mav.mission_set_current_send(target_sys, target_comp, 0)
+                    except Exception:
+                        pass
+
+                self._mutex.unlock()
+                if ack and getattr(ack, 'type', None) == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                    success_msg = f"MISSION UPLOAD: SUCCESS ({count} WPs)"
+                    self.mission_ack_signal.emit(success_msg)
+                    self.command_ack_signal.emit(success_msg)
+                    app_state.set_mission_status("UPLOADED")
+                    app_state.set_command_feedback(success_msg)
+                else:
+                    ack_type = getattr(ack, 'type', 'timeout')
+                    err_msg = f"MISSION UPLOAD REJECTED (ACK type={ack_type})"
+                    self.command_ack_signal.emit(err_msg)
+                    app_state.set_command_feedback(err_msg)
+            except Exception as e:
+                self._mutex.unlock()
+                err_msg = f"MISSION UPLOAD ERROR: {str(e)}"
+                self.command_ack_signal.emit(err_msg)
+                app_state.set_command_feedback(err_msg)
+
+        import threading
+        threading.Thread(target=_do_upload, daemon=True).start()
+
+    def start_mission(self):
+        """Start autonomous mission flight in PX4 / Gazebo."""
+        if self._mock_mode:
+            from gcs.mavlink import commands
+            self.dispatch_mock(commands.mock_guided())
+            app_state.set_mission_status("RUNNING")
+            return
+        if self._mav is None:
+            return
+        try:
+            # 1. Arm
+            self.arm()
+            time.sleep(0.1)
+            self._mutex.lock()
+            # 2. Switch to PX4 AUTO_MISSION mode: (4, 4) = 67371008
+            self._mav.mav.set_mode_send(
+                self._sysid,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                67371008
+            )
+            # 3. Send MAV_CMD_MISSION_START
+            self._mav.mav.command_long_send(
+                self._sysid, self._compid,
+                mavutil.mavlink.MAV_CMD_MISSION_START,
+                0, 0, 0, 0, 0, 0, 0, 0
+            )
+            self._mutex.unlock()
+            msg = "MISSION STARTED"
+            self.command_ack_signal.emit(msg)
+            app_state.set_mission_status("RUNNING")
+            app_state.set_command_feedback(msg)
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"START MISSION ERROR: {e}")
+
+    def pause_mission(self):
+        """Pause mission and hold position (LOITER)."""
+        self.hold()
+        app_state.set_mission_status("PAUSED")
+
+    def clear_mission(self):
+        """Clear mission waypoints."""
+        if self._mock_mode:
+            self._mock_mission_waypoints = []
+            app_state.set_mission_status("IDLE")
+            return
+        if self._mav is None:
+            return
+        try:
+            self._mutex.lock()
+            self._mav.mav.mission_clear_all_send(self._sysid, self._compid)
+            self._mutex.unlock()
+            msg = "MISSION CLEARED"
+            self.command_ack_signal.emit(msg)
+            app_state.set_mission_status("IDLE")
+            app_state.set_command_feedback(msg)
+        except Exception as e:
+            self._mutex.unlock()
+            self.command_ack_signal.emit(f"CLEAR ERROR: {e}")
+
+    def download_mission(self):
+        """Download waypoints from vehicle."""
+        if self._mock_mode:
+            if not self._mock_mission_waypoints:
+                from gcs.mavlink.mission_manager import Waypoint
+                self._mock_mission_waypoints = [
+                    Waypoint(seq=1, command=16, lat=37.7758, lon=-122.4184, alt=25.0, param1=3.0),
+                    Waypoint(seq=2, command=16, lat=37.7765, lon=-122.4205, alt=30.0, param1=5.0),
+                    Waypoint(seq=3, command=16, lat=37.7745, lon=-122.4215, alt=25.0, param1=2.0),
+                ]
+            wps_dicts = [wp.to_dict() if hasattr(wp, "to_dict") else wp for wp in self._mock_mission_waypoints]
+            self.mission_downloaded_signal.emit(wps_dicts)
+            app_state.set_mission_waypoints(wps_dicts)
+            app_state.set_mission_status("LOADED")
+            msg = f"MISSION DOWNLOAD: SUCCESS ({len(wps_dicts)} WPs)"
+            self.command_ack_signal.emit(msg)
+            app_state.set_command_feedback(msg)
+            return
+
+        if self._mav is None:
+            self.command_ack_signal.emit("DOWNLOAD FAILED: NO CONNECTION")
+            return
+
+        def _do_download():
+            try:
+                self._mutex.lock()
+                self._mav.mav.mission_request_list_send(self._sysid, self._compid)
+                msg_count = self._mav.recv_match(type=['MISSION_COUNT'], blocking=True, timeout=3.0)
+                if msg_count is None:
+                    raise TimeoutError("Timeout waiting for MISSION_COUNT")
+
+                count = msg_count.count
+                downloaded_wps = []
+                for seq in range(count):
+                    self._mav.mav.mission_request_int_send(self._sysid, self._compid, seq)
+                    item = self._mav.recv_match(type=['MISSION_ITEM_INT', 'MISSION_ITEM'], blocking=True, timeout=3.0)
+                    if item is None:
+                        raise TimeoutError(f"Timeout waiting for WP #{seq}")
+                    lat = item.x / 1e7 if item.get_type() == 'MISSION_ITEM_INT' else item.x
+                    lon = item.y / 1e7 if item.get_type() == 'MISSION_ITEM_INT' else item.y
+                    wp = {
+                        "seq": seq + 1,
+                        "command": item.command,
+                        "frame": item.frame,
+                        "lat": lat,
+                        "lon": lon,
+                        "alt": item.z,
+                        "param1": item.param1,
+                        "param2": item.param2,
+                        "param3": item.param3,
+                        "param4": item.param4,
+                        "autocontinue": bool(item.autocontinue),
+                        "is_current": bool(item.current)
+                    }
+                    downloaded_wps.append(wp)
+
+                self._mav.mav.mission_ack_send(self._sysid, self._compid, mavutil.mavlink.MAV_MISSION_ACCEPTED)
+                self._mutex.unlock()
+
+                self.mission_downloaded_signal.emit(downloaded_wps)
+                app_state.set_mission_waypoints(downloaded_wps)
+                app_state.set_mission_status("LOADED")
+                success_msg = f"MISSION DOWNLOAD: SUCCESS ({len(downloaded_wps)} WPs)"
+                self.command_ack_signal.emit(success_msg)
+                app_state.set_command_feedback(success_msg)
+            except Exception as e:
+                self._mutex.unlock()
+                self.command_ack_signal.emit(f"MISSION DOWNLOAD ERROR: {str(e)}")
+
+        import threading
+        threading.Thread(target=_do_download, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Payload Release
     # ──────────────────────────────────────────────────────────────────────────
     def release_payload(self, servo_channel: int = 9, pwm: int = 1900):
-        """Trigger emergency payload release via MAVLink command."""
+        """Trigger emergency payload release via MAV_CMD_DO_SET_SERVO."""
         from gcs.mavlink import commands
         if self._mock_mode:
             result = commands.mock_payload_release(servo_channel, pwm)
             self.dispatch_mock(result)
         else:
-            # Send via action actuator or pymavlink dispatch
-            self.dispatch_mock(commands.mock_payload_release(servo_channel, pwm))
-            msg = f"EMERGENCY PAYLOAD RELEASED: SERVO {servo_channel} PWM {pwm} [MAVSDK]"
-            self.command_ack_signal.emit(msg)
-            app_state.set_command_feedback(msg)
+            self.dispatch_real(commands.send_payload_release, servo_channel, pwm)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Backward Compatibility Dispatches
+    # Dispatchers
     # ──────────────────────────────────────────────────────────────────────────
     def dispatch_mock(self, mock_result: dict):
         """Apply a mock command result (patches telemetry state & emits feedback)."""
@@ -794,8 +872,7 @@ class QMavsdkWorker(QThread):
         self.command_ack_signal.emit(feedback)
 
     def dispatch_real(self, cmd_func, *args) -> str:
-        """Fallback real command dispatcher matching QMavlinkWorker interface."""
-        # Route to native MAVSDK methods when mapped
+        """Route to appropriate high-level command or execute direct helper."""
         func_name = getattr(cmd_func, "__name__", "")
         if "arm" in func_name and "disarm" not in func_name:
             self.arm()
@@ -819,6 +896,9 @@ class QMavsdkWorker(QThread):
         elif "posctl" in func_name:
             self.posctl()
             return "POSCTL MODE ACTIVATED"
+        elif "altctl" in func_name:
+            self.altctl()
+            return "ALTCTL MODE ACTIVATED"
         elif "mission_start" in func_name:
             self.start_mission()
             return "MISSION STARTED"
@@ -828,20 +908,29 @@ class QMavsdkWorker(QThread):
         elif "abort" in func_name:
             self.rtl()
             return "EMERGENCY ABORT INITIATED — RTL"
-        elif "payload" in func_name:
-            self.release_payload()
-            return "PAYLOAD RELEASE COMMAND SENT"
-        return "COMMAND SENT"
+
+        if self._mav is None:
+            return "NO ACTIVE CONNECTION"
+        try:
+            self._mutex.lock()
+            result = cmd_func(self._mav, *args)
+            self._mutex.unlock()
+            self.command_ack_signal.emit(result)
+            return result
+        except Exception as e:
+            self._mutex.unlock()
+            err = f"COMMAND ERROR: {str(e)}"
+            self.command_ack_signal.emit(err)
+            return err
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Mock Simulation Physics Loop
+    # Mock Simulation Loop
     # ──────────────────────────────────────────────────────────────────────────
     def _run_mock_loop(self):
-        """Mock telemetry generator and navigation loop for offline development and unit tests."""
-        self.connected_signal.emit(1, 1, "PX4 Autopilot (MAVSDK Mock SITL)")
-        self.statustext_signal.emit(6, "MAVSDK Simulation Mode Connected [Mock Engine]")
+        self.connected_signal.emit(1, 1, "PX4 Autopilot (Simulation Mode)")
+        self.statustext_signal.emit(6, "Simulation Mode Connected [Direct Engine]")
         self.statustext_signal.emit(6, "EKF3 IMU0 is using GPS")
-        self.statustext_signal.emit(6, "PX4 Autopilot V1.15.0-dev (MAVSDK Mock)")
+        self.statustext_signal.emit(6, "PX4 Autopilot V1.15.0 (Simulation)")
 
         generator = MockTelemetryGenerator()
         tick = 0
@@ -851,7 +940,6 @@ class QMavsdkWorker(QThread):
 
             self._mutex.lock()
             mode = self._mock_telemetry_state.get("mode", "")
-            # Autonomous mission waypoint navigation
             if mode in ("AUTO", "GUIDED", "MISSION") and self._mock_mission_waypoints:
                 if self._mock_active_wp_index < len(self._mock_mission_waypoints):
                     target = self._mock_mission_waypoints[self._mock_active_wp_index]
@@ -889,7 +977,6 @@ class QMavsdkWorker(QThread):
                             "groundspeed": 12.0,
                         })
 
-            # Manual remote control physics in mock mode
             if self._manual_active:
                 vx = (self._manual_x / 1000.0) * 0.00008
                 vy = (self._manual_y / 1000.0) * 0.00008
@@ -917,7 +1004,7 @@ class QMavsdkWorker(QThread):
         self.disconnected_signal.emit("Simulation stopped")
 
     def stop(self):
-        """Safely stop worker thread and asyncio loop."""
+        """Stop worker thread safely."""
         self._running = False
         self.quit()
         self.wait(1000)
