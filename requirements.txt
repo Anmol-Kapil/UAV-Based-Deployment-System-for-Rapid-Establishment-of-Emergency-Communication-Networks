@@ -1,11 +1,9 @@
-# Phases 1-4 needed no Python dependencies (standalone stdlib-only modules
-# plus a static Leaflet/vanilla-JS frontend). Phase 5 adds the backend API:
+# Backend & GCS Dependencies
+fastapi          # Backend REST API
+uvicorn          # ASGI server for FastAPI
+httpx            # TestClient / HTTP client
+PySide6          # Qt Desktop GUI Framework
+mavsdk>=3.0.0    # MAVSDK Headless Autopilot SDK for PX4
+grpcio>=1.64.0   # gRPC engine for MAVSDK
+pymavlink        # MAVLink serialization & protocol support
 
-fastapi          # Phase 5 — backend API
-uvicorn          # Phase 5 — ASGI server for FastAPI
-httpx            # Phase 5 — required by FastAPI's TestClient (tests only)
-
-# Uncomment as each later phase is implemented:
-#
-# pymavlink        # Phase 6 — MAVLink connection to ArduPilot SITL
-# websockets       # Phase 7 — live telemetry streaming

@@ -37,8 +37,9 @@ class ConnectionDialog(QDialog):
         self.combo_type = QComboBox()
         self.combo_type.addItems([
             "Mock Telemetry (Demo / Simulation)",
-            "UDP Server (127.0.0.1:14550 - SITL)",
-            "UDP Client",
+            "MAVSDK PX4 SITL Companion (udpin://0.0.0.0:14540)",
+            "MAVSDK PX4 SITL GCS (udpin://0.0.0.0:14550)",
+            "UDP Client (Custom Host/Port)",
             "TCP Client",
             "Serial (Radio / USB)"
         ])
@@ -46,11 +47,11 @@ class ConnectionDialog(QDialog):
         form.addRow("Protocol:", self.combo_type)
 
         # Host / IP
-        self.input_host = QLineEdit("127.0.0.1")
+        self.input_host = QLineEdit("0.0.0.0")
         form.addRow("Host / IP:", self.input_host)
 
         # Port
-        self.input_port = QLineEdit("14550")
+        self.input_port = QLineEdit("14540")
         form.addRow("Port:", self.input_port)
 
         # Baud Rate
@@ -101,11 +102,23 @@ class ConnectionDialog(QDialog):
             self.input_host.setEnabled(False)
             self.input_port.setEnabled(False)
             self.combo_baud.setEnabled(False)
-        elif index in (1, 2, 3):  # UDP/TCP
+        elif index == 1:  # MAVSDK SITL 14540
+            self.input_host.setText("0.0.0.0")
+            self.input_port.setText("14540")
             self.input_host.setEnabled(True)
             self.input_port.setEnabled(True)
             self.combo_baud.setEnabled(False)
-        elif index == 4:  # Serial
+        elif index == 2:  # MAVSDK SITL 14550
+            self.input_host.setText("0.0.0.0")
+            self.input_port.setText("14550")
+            self.input_host.setEnabled(True)
+            self.input_port.setEnabled(True)
+            self.combo_baud.setEnabled(False)
+        elif index in (3, 4):  # UDP/TCP Client
+            self.input_host.setEnabled(True)
+            self.input_port.setEnabled(True)
+            self.combo_baud.setEnabled(False)
+        elif index == 5:  # Serial
             self.input_host.setText("COM3" if self._is_windows() else "/dev/ttyUSB0")
             self.input_host.setEnabled(True)
             self.input_port.setEnabled(False)
@@ -116,17 +129,20 @@ class ConnectionDialog(QDialog):
         return sys.platform.startswith("win")
 
     def get_connection_string(self):
-        """Build pymavlink connection string from dialog inputs."""
+        """Build MAVSDK connection string from dialog inputs."""
         idx = self.combo_type.currentIndex()
         if idx == 0:
             return "mock://127.0.0.1:14550", 57600
-        elif idx == 1:
-            return f"udpin:{self.input_host.text().strip()}:{self.input_port.text().strip()}", 57600
-        elif idx == 2:
-            return f"udpout:{self.input_host.text().strip()}:{self.input_port.text().strip()}", 57600
+        elif idx in (1, 2):
+            host = self.input_host.text().strip() or "0.0.0.0"
+            port = self.input_port.text().strip() or "14540"
+            return f"udpin://{host}:{port}", 57600
         elif idx == 3:
-            return f"tcp:{self.input_host.text().strip()}:{self.input_port.text().strip()}", 57600
+            return f"udpout://{self.input_host.text().strip()}:{self.input_port.text().strip()}", 57600
         elif idx == 4:
+            return f"tcp://{self.input_host.text().strip()}:{self.input_port.text().strip()}", 57600
+        elif idx == 5:
             baud = int(self.combo_baud.currentText())
-            return self.input_host.text().strip(), baud
-        return "udp:127.0.0.1:14550", 57600
+            return f"serial://{self.input_host.text().strip()}:{baud}", baud
+        return "udpin://0.0.0.0:14540", 57600
+
