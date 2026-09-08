@@ -286,55 +286,72 @@ class QMavlinkWorker(QThread):
         def _do_upload():
             try:
                 self._mutex.lock()
-                self._mav.mav.mission_clear_all_send(self._mav.target_system, self._mav.target_component)
+                target_sys = getattr(self._mav, "target_system", 1) or 1
+                target_comp = getattr(self._mav, "target_component", 1) or 1
+
+                self._mav.mav.mission_clear_all_send(target_sys, target_comp)
                 time.sleep(0.1)
 
                 count = len(waypoints)
-                self._mav.mav.mission_count_send(self._mav.target_system, self._mav.target_component, count)
+                self._mav.mav.mission_count_send(target_sys, target_comp, count)
 
                 for _ in range(count):
-                    req = self._mav.recv_match(type=['MISSION_REQUEST', 'MISSION_REQUEST_INT'], blocking=True, timeout=3.0)
+                    req = self._mav.recv_match(type=['MISSION_REQUEST', 'MISSION_REQUEST_INT'], blocking=True, timeout=5.0)
                     if req is None:
-                        raise TimeoutError("Timeout waiting for MISSION_REQUEST")
+                        raise TimeoutError("Timeout waiting for MISSION_REQUEST from vehicle")
                     seq = req.seq
                     wp = waypoints[seq]
-                    cmd = wp.command if hasattr(wp, "command") else wp.get("command", 16)
-                    frame = wp.frame if hasattr(wp, "frame") else wp.get("frame", 3)
-                    p1 = wp.param1 if hasattr(wp, "param1") else wp.get("param1", 0.0)
-                    p2 = wp.param2 if hasattr(wp, "param2") else wp.get("param2", 2.0)
-                    p3 = wp.param3 if hasattr(wp, "param3") else wp.get("param3", 0.0)
-                    p4 = wp.param4 if hasattr(wp, "param4") else wp.get("param4", 0.0)
-                    lat = wp.lat if hasattr(wp, "lat") else wp.get("lat", 0.0)
-                    lon = wp.lon if hasattr(wp, "lon") else wp.get("lon", 0.0)
-                    alt = wp.alt if hasattr(wp, "alt") else wp.get("alt", 25.0)
+                    cmd = int(wp.command if hasattr(wp, "command") else wp.get("command", 16))
+                    frame = int(wp.frame if hasattr(wp, "frame") else wp.get("frame", 3))
+                    p1 = float(wp.param1 if hasattr(wp, "param1") else wp.get("param1", 0.0) or 0.0)
+                    p2 = float(wp.param2 if hasattr(wp, "param2") else wp.get("param2", 2.0) or 2.0)
+                    p3 = float(wp.param3 if hasattr(wp, "param3") else wp.get("param3", 0.0) or 0.0)
+                    p4 = float(wp.param4 if hasattr(wp, "param4") else wp.get("param4", 0.0) or 0.0)
+                    lat = float(wp.lat if hasattr(wp, "lat") else wp.get("lat", 0.0) or 0.0)
+                    lon = float(wp.lon if hasattr(wp, "lon") else wp.get("lon", 0.0) or 0.0)
+                    alt = float(wp.alt if hasattr(wp, "alt") else wp.get("alt", 25.0) or 25.0)
+
+                    is_current = 1 if seq == 0 else 0
+                    autocontinue = 1
 
                     if req.get_type() == 'MISSION_REQUEST_INT':
                         self._mav.mav.mission_item_int_send(
-                            self._mav.target_system, self._mav.target_component,
-                            seq, frame, cmd, 0, 1, p1, p2, p3, p4,
+                            target_sys, target_comp,
+                            seq, frame, cmd, is_current, autocontinue, p1, p2, p3, p4,
                             int(lat * 1e7), int(lon * 1e7), float(alt)
                         )
                     else:
                         self._mav.mav.mission_item_send(
-                            self._mav.target_system, self._mav.target_component,
-                            seq, frame, cmd, 0, 1, p1, p2, p3, p4,
+                            target_sys, target_comp,
+                            seq, frame, cmd, is_current, autocontinue, p1, p2, p3, p4,
                             float(lat), float(lon), float(alt)
                         )
 
-                ack = self._mav.recv_match(type='MISSION_ACK', blocking=True, timeout=3.0)
+                ack = self._mav.recv_match(type='MISSION_ACK', blocking=True, timeout=5.0)
+                if ack and getattr(ack, 'type', None) == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                    # Set active waypoint 0
+                    try:
+                        self._mav.mav.mission_set_current_send(target_sys, target_comp, 0)
+                    except Exception:
+                        pass
+
                 self._mutex.unlock()
-                if ack and ack.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                if ack and getattr(ack, 'type', None) == mavutil.mavlink.MAV_MISSION_ACCEPTED:
                     success_msg = f"MISSION UPLOAD: SUCCESS ({count} WPs)"
                     self.mission_ack_signal.emit(success_msg)
                     self.command_ack_signal.emit(success_msg)
                     app_state.set_mission_status("UPLOADED")
                     app_state.set_command_feedback(success_msg)
                 else:
-                    err_msg = f"MISSION UPLOAD REJECTED (type={getattr(ack, 'type', 'timeout')})"
+                    ack_type = getattr(ack, 'type', 'timeout')
+                    err_msg = f"MISSION UPLOAD REJECTED (ACK type={ack_type})"
                     self.command_ack_signal.emit(err_msg)
+                    app_state.set_command_feedback(err_msg)
             except Exception as e:
                 self._mutex.unlock()
-                self.command_ack_signal.emit(f"MISSION UPLOAD ERROR: {str(e)}")
+                err_msg = f"MISSION UPLOAD ERROR: {str(e)}"
+                self.command_ack_signal.emit(err_msg)
+                app_state.set_command_feedback(err_msg)
 
         import threading
         threading.Thread(target=_do_upload, daemon=True).start()

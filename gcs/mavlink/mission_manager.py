@@ -225,19 +225,48 @@ class MissionPlan:
         plan = cls()
         mission_obj = data.get("mission", {})
         items = mission_obj.get("items", [])
-        for i, item in enumerate(items):
-            params = item.get("params", [0, 0, 0, 0, 0, 0, 0])
+
+        def _float(val, default=0.0) -> float:
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+
+        def _extract_item_wp(seq_num: int, item: dict) -> Optional[Waypoint]:
+            params = item.get("params", []) or []
             cmd = item.get("command", MAV_CMD_NAV_WAYPOINT)
-            lat = params[4] if len(params) > 4 else 0.0
-            lon = params[5] if len(params) > 5 else 0.0
-            alt = params[6] if len(params) > 6 else item.get("Altitude", 25.0)
-            p1 = params[0] if len(params) > 0 else 0.0
-            p2 = params[1] if len(params) > 1 else 2.0
-            p3 = params[2] if len(params) > 2 else 0.0
-            p4 = params[3] if len(params) > 3 else 0.0
-            wp = Waypoint(
-                seq=i + 1,
-                command=cmd,
+            if isinstance(cmd, str):
+                cmd = NAME_TO_COMMAND.get(cmd.upper(), MAV_CMD_NAV_WAYPOINT)
+
+            p1 = _float(params[0]) if len(params) > 0 else 0.0
+            p2 = _float(params[1]) if len(params) > 1 else 2.0
+            p3 = _float(params[2]) if len(params) > 2 else 0.0
+            p4 = _float(params[3]) if len(params) > 3 else 0.0
+            lat = _float(params[4]) if len(params) > 4 and params[4] is not None else 0.0
+            lon = _float(params[5]) if len(params) > 5 and params[5] is not None else 0.0
+            alt = _float(params[6]) if len(params) > 6 and params[6] is not None else _float(item.get("Altitude"), 25.0)
+
+            # Check coordinate list fallback [lat, lon, alt]
+            coord = item.get("Coordinate") or item.get("coordinate")
+            if (lat == 0.0 and lon == 0.0) and isinstance(coord, list) and len(coord) >= 2:
+                lat = _float(coord[0])
+                lon = _float(coord[1])
+                if len(coord) >= 3:
+                    alt = _float(coord[2])
+
+            frame = int(item.get("frame", 3))
+            autocontinue = bool(item.get("autoContinue", True))
+
+            # Skip items with invalid zero coordinates unless it's RTL or LAND
+            if lat == 0.0 and lon == 0.0 and cmd not in (MAV_CMD_NAV_RETURN_TO_LAUNCH, MAV_CMD_NAV_LAND):
+                return None
+
+            return Waypoint(
+                seq=seq_num,
+                command=int(cmd),
+                frame=frame,
                 lat=lat,
                 lon=lon,
                 alt=alt,
@@ -245,9 +274,25 @@ class MissionPlan:
                 param2=p2,
                 param3=p3,
                 param4=p4,
-                autocontinue=item.get("autoContinue", True)
+                autocontinue=autocontinue
             )
-            plan.waypoints.append(wp)
+
+        seq = 1
+        for item in items:
+            # Simple item
+            wp = _extract_item_wp(seq, item)
+            if wp:
+                plan.waypoints.append(wp)
+                seq += 1
+            # Handle QGC Complex items (e.g. Survey, CorridorScan)
+            sub_items = item.get("transectCmds") or item.get("visualItems") or item.get("items") or []
+            for sub in sub_items:
+                if isinstance(sub, dict):
+                    sub_wp = _extract_item_wp(seq, sub)
+                    if sub_wp:
+                        plan.waypoints.append(sub_wp)
+                        seq += 1
+
         return plan
 
     @classmethod

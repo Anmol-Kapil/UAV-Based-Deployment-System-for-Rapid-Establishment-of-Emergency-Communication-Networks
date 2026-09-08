@@ -66,6 +66,7 @@ def send_disarm(mav) -> str:
 def send_takeoff(mav, altitude: float = 5.0) -> str:
     """Send ARM & TAKEOFF commands to vehicle at specified relative altitude (metres)."""
     try:
+        import time
         sys_id = getattr(mav, "target_system", 1) or 1
         comp_id = getattr(mav, "target_component", 1) or 1
         # 1. Arm vehicle first
@@ -74,6 +75,7 @@ def send_takeoff(mav, altitude: float = 5.0) -> str:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 1, 0, 0, 0, 0, 0, 0
         )
+        time.sleep(0.1)
         # 2. Send MAV_CMD_NAV_TAKEOFF with target altitude
         mav.mav.command_long_send(
             sys_id, comp_id,
@@ -132,6 +134,7 @@ def send_abort(mav) -> str:
 def send_mission_start(mav) -> str:
     """Start autonomous mission flight in PX4 / ArduPilot."""
     try:
+        import time
         sys_id = getattr(mav, "target_system", 1) or 1
         comp_id = getattr(mav, "target_component", 1) or 1
         # 1. Arm vehicle
@@ -140,6 +143,7 @@ def send_mission_start(mav) -> str:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 1, 0, 0, 0, 0, 0, 0
         )
+        time.sleep(0.1)
         # 2. Send MAV_CMD_MISSION_START
         mav.mav.command_long_send(
             sys_id, comp_id,
@@ -153,23 +157,14 @@ def send_mission_start(mav) -> str:
         return f"MISSION START FAILED: {str(e)}"
 
 
-
 def _send_set_mode(mav, mode_str: str) -> str:
     """Set flight mode by name using MAVLink (supports both PX4 and ArduPilot)."""
     try:
-        sys_id = mav.target_system if getattr(mav, "target_system", 0) != 0 else 1
-        comp_id = mav.target_component if getattr(mav, "target_component", 0) != 0 else 1
+        sys_id = getattr(mav, "target_system", 1) or 1
+        comp_id = getattr(mav, "target_component", 1) or 1
         mode_upper = mode_str.upper()
 
-        # 1. Try pymavlink built-in PX4 mode helper if available
-        if hasattr(mav, "set_mode_px4"):
-            try:
-                mav.set_mode_px4(mode_upper)
-                return f"MODE → {mode_upper} SENT (PX4)"
-            except Exception:
-                pass
-
-        # 2. PX4 custom mode mapping for command_long_send MAV_CMD_DO_SET_MODE
+        # PX4 custom mode mapping
         px4_modes = {
             "AUTO": (4, 4),
             "MISSION": (4, 4),
@@ -188,6 +183,15 @@ def _send_set_mode(mav, mode_str: str) -> str:
         if mode_upper in px4_modes:
             main_m, sub_m = px4_modes[mode_upper]
             try:
+                custom_mode = (main_m << 16) | (sub_m << 24)
+                mav.mav.set_mode_send(
+                    sys_id,
+                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    custom_mode
+                )
+            except Exception:
+                pass
+            try:
                 mav.mav.command_long_send(
                     sys_id,
                     comp_id,
@@ -200,8 +204,9 @@ def _send_set_mode(mav, mode_str: str) -> str:
                 )
             except Exception:
                 pass
+            return f"MODE → {mode_upper} SENT (PX4)"
 
-        # 3. ArduPilot custom mode mapping fallback
+        # ArduPilot custom mode mapping fallback
         mode_id = ARDUPILOT_MODES.get(mode_upper)
         if mode_id is not None:
             mav.mav.set_mode_send(
@@ -214,7 +219,6 @@ def _send_set_mode(mav, mode_str: str) -> str:
         return f"MODE → {mode_upper} COMMAND SENT"
     except Exception as e:
         return f"SET MODE FAILED: {str(e)}"
-
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -260,11 +264,6 @@ def mock_abort() -> dict:
     return {"result": "ABORT ENGAGED — RTL COMMAND SENT [MOCK]", "telemetry_patch": {"mode": "RTL"}}
 
 
-def send_mission_start(mav) -> str:
-    """Start autonomous mission execution by switching to AUTO mode."""
-    return _send_set_mode(mav, "AUTO")
-
-
 def mock_mission_start() -> dict:
     return {"result": "MISSION START COMMAND SENT [MOCK]", "telemetry_patch": {"mode": "AUTO"}}
 
@@ -272,9 +271,11 @@ def mock_mission_start() -> dict:
 def send_payload_release(mav, servo_channel: int = 9, pwm: int = 1900) -> str:
     """Actuate payload release servo via MAV_CMD_DO_SET_SERVO."""
     try:
+        sys_id = getattr(mav, "target_system", 1) or 1
+        comp_id = getattr(mav, "target_component", 1) or 1
         mav.mav.command_long_send(
-            mav.target_system,
-            mav.target_component,
+            sys_id,
+            comp_id,
             mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
             0,
             servo_channel, pwm, 0, 0, 0, 0, 0
@@ -289,5 +290,3 @@ def mock_payload_release(servo_channel: int = 9, pwm: int = 1900) -> dict:
         "result": f"PAYLOAD RELEASE COMMAND SENT [MOCK] — SERVO CH{servo_channel} PWM:{pwm}",
         "telemetry_patch": {"payload_release_actuated": True}
     }
-
-
