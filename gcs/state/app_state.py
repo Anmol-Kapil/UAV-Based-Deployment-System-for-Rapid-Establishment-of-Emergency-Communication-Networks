@@ -759,6 +759,25 @@ class AppState(QObject):
         backend_client.post_area(polygon)
 
 
+    @property
+    def uav_latitude(self) -> float:
+        """Returns the current UAV latitude from telemetry (fallback to home_lat)."""
+        lat = self.telemetry.get("lat", self.home_lat)
+        try:
+            return float(lat)
+        except (ValueError, TypeError):
+            return self.home_lat
+
+    @property
+    def uav_longitude(self) -> float:
+        """Returns the current UAV longitude from telemetry (fallback to home_lon)."""
+        lon = self.telemetry.get("lon", self.home_lon)
+        try:
+            return float(lon)
+        except (ValueError, TypeError):
+            return self.home_lon
+
+
 # Singleton instance
 app_state = AppState()
 

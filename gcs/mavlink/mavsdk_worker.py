@@ -4,8 +4,8 @@ Direct, reliable MAVLink communications engine for PX4 SITL (Gazebo) and ArduPil
 Provides:
 - Direct UDP socket listener on port 14550 (PX4 GCS default) & port 14540 (PX4 companion)
 - Zero subprocess overhead, zero gRPC dependencies, zero noisy terminal log spam
-- 1 Hz GCS Heartbeat responder ensuring PX4 maintains active connection state
-- Preflight parameter auto-bypass: CBRK_SUPPLY_CHK (power check) & COM_DISARM_PREROL (auto-disarm)
+- 2 Hz GCS Heartbeat responder ensuring PX4 maintains active connection state
+- Preflight parameter auto-bypass: CBRK_SUPPLY_CHK & COM_DISARM_PRFLT
 - Atomic Takeoff, Arm, Disarm, Land, RTL, and Hold flight operations
 - High-rate 10 Hz MANUAL_CONTROL (#69) streaming for Virtual D-Pads & Keyboard WASD
 - Object-oriented mission upload & execution (MissionPlan / MissionItem)
@@ -14,6 +14,7 @@ Provides:
 
 import math
 import time
+import threading
 import socket
 from typing import List, Dict, Any, Optional
 from PySide6.QtCore import QThread, Signal, QMutex
@@ -88,18 +89,18 @@ class QMavsdkWorker(QThread):
         def _beat():
             while self._running:
                 if self._mav is not None and not self._mock_mode:
-                    try:
-                        self._mutex.lock()
-                        self._mav.mav.heartbeat_send(
-                            mavutil.mavlink.MAV_TYPE_GCS,
-                            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                            0, 0, 0
-                        )
-                        self._mutex.unlock()
-                    except Exception:
-                        self._mutex.unlock()
+                    if self._mutex.tryLock(50):  # non-blocking — avoids deadlock with main loop
+                        try:
+                            self._mav.mav.heartbeat_send(
+                                mavutil.mavlink.MAV_TYPE_GCS,
+                                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                                0, 0, 0
+                            )
+                        except Exception:
+                            pass
+                        finally:
+                            self._mutex.unlock()
                 time.sleep(0.5)
-        import threading
         threading.Thread(target=_beat, daemon=True, name="GCS-Heartbeat").start()
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -146,18 +147,14 @@ class QMavsdkWorker(QThread):
                 if now - self._last_manual_send >= 0.1:
                     self._last_manual_send = now
                     if self._manual_active and self._mav is not None:
-                        try:
-                            self._mutex.lock()
-                            mx = self._manual_x
-                            my = self._manual_y
-                            mz = self._manual_z
-                            mr = self._manual_r
-                            self._mutex.unlock()
-                            self._mav.mav.manual_control_send(
-                                self._sysid, mx, my, mz, mr, 0
-                            )
-                        except Exception:
-                            self._mutex.unlock()
+                        if self._mutex.tryLock(10):
+                            try:
+                                mx, my, mz, mr = self._manual_x, self._manual_y, self._manual_z, self._manual_r
+                                self._mav.mav.manual_control_send(self._sysid, mx, my, mz, mr, 0)
+                            except Exception:
+                                pass
+                            finally:
+                                self._mutex.unlock()
 
                 # Read incoming MAVLink packet
                 msg = self._mav.recv_match(blocking=True, timeout=0.15)
@@ -235,10 +232,10 @@ class QMavsdkWorker(QThread):
                     if self._connected:
                         self.telemetry_updated.emit(dict(telemetry_cache))
 
-                # Heartbeat timeout check (4.0s)
-                if self._connected and (now - self._last_heartbeat_time > 4.0):
+                # Heartbeat timeout check (6.0s — generous for SITL startup delay)
+                if self._connected and (now - self._last_heartbeat_time > 6.0):
                     self._connected = False
-                    self.disconnected_signal.emit("Vehicle heartbeat timeout (>4.0s)")
+                    self.disconnected_signal.emit("Vehicle heartbeat timeout (>6.0s)")
 
             except Exception:
                 pass
@@ -319,53 +316,72 @@ class QMavsdkWorker(QThread):
         """Auto-configure all PX4 SITL circuit breakers so health checks pass cleanly."""
         if self._mock_mode or self._mav is None:
             return
+
         def _do_config():
             try:
-                time.sleep(0.2)
-                # Valid INT32 Circuit Breakers & Pre-Arm Overrides for Multicopter SITL
+                time.sleep(0.3)
                 params_int = {
                     "CBRK_SUPPLY_CHK": 894281,  # Bypass battery / power module check
                     "CBRK_USB_CHK": 197848,     # Bypass USB connection check
                     "CBRK_IO_SAFETY": 22027,    # Bypass hardware safety switch
-                    "COM_RC_IN_MODE": 1,        # Joystick mode (disables RC transmitter requirement & checks)
+                    "COM_RC_IN_MODE": 1,        # Joystick mode (no RC transmitter needed)
                     "NAV_RCL_ACT": 0,           # Disable RC Loss failsafe
                     "NAV_DLL_ACT": 0,           # Disable DataLink Loss failsafe
-                    "COM_RCL_EXCEPT": 7,        # Ignore RC/link loss in Mission(1) + Hold(2) + Offboard(4)
+                    "COM_RCL_EXCEPT": 7,        # Ignore RC/link loss in Mission+Hold+Offboard
                     "COM_ARM_WO_GPS": 1,        # Allow arming without 3D GPS fix
                     "COM_ARM_MAG_STR": 0,       # Disable magnetic anomaly lock
                 }
                 for name, val in params_int.items():
                     self._set_param_int(name, val)
-                    time.sleep(0.02)
-
-                # Float parameters: disable auto-disarm timers (-1.0 disables in PX4)
-                self._set_param_float("COM_DISARM_PRFLT", -1.0)  # Real PX4 parameter! Disables ground auto-disarm
-                self._set_param_float("COM_DISARM_LAND", -1.0)   # Disables landing auto-disarm
-                self._set_param_float("COM_DL_LOSS_T", 120.0)    # Extends GCS connection loss timeout
-                self._set_param_float("MIS_TAKEOFF_ALT", 5.0)    # Default takeoff altitude
+                    time.sleep(0.025)
+                self._set_param_float("COM_DISARM_PRFLT", -1.0)
+                self._set_param_float("COM_DISARM_LAND", -1.0)
+                self._set_param_float("COM_DL_LOSS_T", 120.0)
+                self._set_param_float("MIS_TAKEOFF_ALT", 5.0)
                 time.sleep(0.05)
-
-                # Disengage safety switch via MAVLink command (SAFETY_SWITCH_STATE_DANGEROUS = 1)
                 try:
                     self._mav.mav.command_long_send(
                         self._sysid, self._compid,
-                        5300,  # MAV_CMD_DO_SET_SAFETY_SWITCH_STATE
-                        0,
-                        1, 0, 0, 0, 0, 0, 0  # 1 = Safety Off / Armed
+                        5300, 0, 1, 0, 0, 0, 0, 0, 0
                     )
                 except Exception:
                     pass
-
-                # Request high-rate data streams
                 self._mav.mav.request_data_stream_send(
                     self._sysid, self._compid,
                     mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
                 )
-                app_state.log("INFO", "PX4", "Configured PX4 SITL bypasses (CBRK_SUPPLY_CHK, CBRK_USB_CHK, CBRK_IO_SAFETY, COM_RC_IN_MODE, COM_ARM_WO_GPS, COM_DISARM_PRFLT=-1).")
+                app_state.log("INFO", "PX4",
+                              "PX4 SITL circuit breakers configured "
+                              "(CBRK_SUPPLY_CHK, CBRK_IO_SAFETY, COM_RC_IN_MODE=1, "
+                              "COM_ARM_WO_GPS=1, COM_DISARM_PRFLT=-1).")
             except Exception as e:
                 app_state.log("DEBUG", "PX4", f"SITL config note: {e}")
-        import threading
+
         threading.Thread(target=_do_config, daemon=True).start()
+
+    def _px4_set_mode(self, main_mode: int, sub_mode: int = 0):
+        """Send PX4 custom mode change via both set_mode AND DO_SET_MODE for reliability."""
+        if self._mav is None:
+            return
+        # PX4 custom_mode: sub_mode<<24 | main_mode<<16
+        custom_mode = (sub_mode << 24) | (main_mode << 16)
+        try:
+            self._mav.mav.set_mode_send(
+                self._sysid,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                custom_mode
+            )
+        except Exception:
+            pass
+        try:
+            self._mav.mav.command_long_send(
+                self._sysid, self._compid,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                main_mode, sub_mode, 0, 0, 0, 0
+            )
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────────────────────────────────
     # Flight Operations (ARM, TAKEOFF, LAND, RTL, POSCTL)
@@ -379,47 +395,36 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             self.command_ack_signal.emit("ARM FAILED: NO CONNECTION")
             return
+
         def _do_arm():
+            # 1. Re-assert circuit breakers (no mutex needed — param_set is one-shot UDP)
+            self._set_param_int("CBRK_SUPPLY_CHK", 894281)
+            self._set_param_int("CBRK_USB_CHK", 197848)
+            self._set_param_int("CBRK_IO_SAFETY", 22027)
+            self._set_param_int("COM_RC_IN_MODE", 1)
+            self._set_param_int("COM_ARM_WO_GPS", 1)
+            self._set_param_float("COM_DISARM_PRFLT", -1.0)
+            time.sleep(0.05)
             try:
-                # 1. Re-assert key circuit breakers and disable auto-disarm
-                self._set_param_int("CBRK_SUPPLY_CHK", 894281)
-                self._set_param_int("CBRK_USB_CHK", 197848)
-                self._set_param_int("CBRK_IO_SAFETY", 22027)
-                self._set_param_int("COM_RC_IN_MODE", 1)
-                self._set_param_int("COM_ARM_WO_GPS", 1)
-                self._set_param_float("COM_DISARM_PRFLT", -1.0)
-                time.sleep(0.04)
-
-                # Disengage safety switch
-                try:
-                    self._mav.mav.command_long_send(
-                        self._sysid, self._compid,
-                        5300,  # MAV_CMD_DO_SET_SAFETY_SWITCH_STATE
-                        0,
-                        1, 0, 0, 0, 0, 0, 0
-                    )
-                except Exception:
-                    pass
-                time.sleep(0.04)
-
-                self._mutex.lock()
-                # 2. Send MAV_CMD_COMPONENT_ARM_DISARM with force=21196.0 (bypass preflight checks)
+                self._mav.mav.command_long_send(
+                    self._sysid, self._compid, 5300, 0, 1, 0, 0, 0, 0, 0, 0
+                )
+            except Exception:
+                pass
+            time.sleep(0.05)
+            try:
+                # 2. Send ARM with force bypass
                 self._mav.mav.command_long_send(
                     self._sysid, self._compid,
                     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                    0,
-                    1,        # 1 = Arm
-                    21196.0,  # Force arm bypass
-                    0, 0, 0, 0, 0
+                    0, 1, 21196.0, 0, 0, 0, 0, 0
                 )
-                self._mutex.unlock()
                 msg = "ARM COMMAND SENT (PREFLIGHT BYPASS ACTIVE)"
                 self.command_ack_signal.emit(msg)
                 app_state.set_command_feedback(msg)
             except Exception as e:
-                self._mutex.unlock()
                 self.command_ack_signal.emit(f"ARM ERROR: {e}")
-        import threading
+
         threading.Thread(target=_do_arm, daemon=True).start()
 
     def disarm(self):
@@ -432,18 +437,15 @@ class QMavsdkWorker(QThread):
             self.command_ack_signal.emit("DISARM FAILED: NO CONNECTION")
             return
         try:
-            self._mutex.lock()
             self._mav.mav.command_long_send(
                 self._sysid, self._compid,
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                 0, 0, 21196.0, 0, 0, 0, 0, 0
             )
-            self._mutex.unlock()
             msg = "DISARM COMMAND SENT"
             self.command_ack_signal.emit(msg)
             app_state.set_command_feedback(msg)
         except Exception as e:
-            self._mutex.unlock()
             self.command_ack_signal.emit(f"DISARM ERROR: {e}")
 
     def takeoff(self, altitude: float = 5.0):
@@ -457,74 +459,52 @@ class QMavsdkWorker(QThread):
             return
 
         def _do_takeoff():
+            # No mutex held — param_set and command_long are one-shot UDP sends
+            self._set_param_int("CBRK_SUPPLY_CHK", 894281)
+            self._set_param_int("CBRK_USB_CHK", 197848)
+            self._set_param_int("CBRK_IO_SAFETY", 22027)
+            self._set_param_int("COM_RC_IN_MODE", 1)
+            self._set_param_int("COM_ARM_WO_GPS", 1)
+            self._set_param_float("COM_DISARM_PRFLT", -1.0)
+            self._set_param_float("MIS_TAKEOFF_ALT", float(altitude))
             try:
-                # 0. Re-assert circuit breakers and disable auto-disarm
-                self._set_param_int("CBRK_SUPPLY_CHK", 894281)
-                self._set_param_int("CBRK_USB_CHK", 197848)
-                self._set_param_int("CBRK_IO_SAFETY", 22027)
-                self._set_param_int("COM_RC_IN_MODE", 1)
-                self._set_param_int("COM_ARM_WO_GPS", 1)
-                self._set_param_float("COM_DISARM_PRFLT", -1.0)
-                self._set_param_float("MIS_TAKEOFF_ALT", float(altitude))
-                try:
-                    self._mav.mav.command_long_send(
-                        self._sysid, self._compid,
-                        5300,  # MAV_CMD_DO_SET_SAFETY_SWITCH_STATE
-                        0,
-                        1, 0, 0, 0, 0, 0, 0
-                    )
-                except Exception:
-                    pass
-                time.sleep(0.05)
-
-                # 1. Arm vehicle (param2 = 21196.0 force arm bypass)
-                self._mutex.lock()
+                self._mav.mav.command_long_send(
+                    self._sysid, self._compid, 5300, 0, 1, 0, 0, 0, 0, 0, 0
+                )
+            except Exception:
+                pass
+            time.sleep(0.06)
+            try:
                 self._mav.mav.command_long_send(
                     self._sysid, self._compid,
                     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                     0, 1, 21196.0, 0, 0, 0, 0, 0
                 )
-                self._mutex.unlock()
-                time.sleep(0.15)
+            except Exception:
+                pass
+            time.sleep(0.2)
+            target_amsl = (self._last_alt_abs + altitude) if self._last_alt_abs > 0.5 else float(altitude)
+            try:
+                self._mav.mav.command_int_send(
+                    self._sysid, self._compid,
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                    0, 0, 0, 0, 0, float('nan'), 0, 0, float(altitude)
+                )
+            except Exception:
+                pass
+            try:
+                self._mav.mav.command_long_send(
+                    self._sysid, self._compid,
+                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                    0, 0, 0, 0, float('nan'), float('nan'), float('nan'), float(target_amsl)
+                )
+            except Exception:
+                pass
+            msg = f"TAKEOFF COMMAND SENT — TARGET ALT: {altitude:.1f} m"
+            self.command_ack_signal.emit(msg)
+            app_state.set_command_feedback(msg)
 
-                # 2. Calculate target AMSL altitude (vital for SITL worlds where ground AMSL > 0)
-                target_amsl = (self._last_alt_abs + altitude) if self._last_alt_abs > 0.5 else float(altitude)
-
-                # 3. Send MAV_CMD_NAV_TAKEOFF via COMMAND_INT (explicitly relative to ground)
-                self._mutex.lock()
-                try:
-                    self._mav.mav.command_int_send(
-                        self._sysid, self._compid,
-                        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                        0, 0,
-                        0, 0, 0, float('nan'),
-                        0, 0,
-                        float(altitude)
-                    )
-                except Exception:
-                    pass
-
-                # 4. Also send MAV_CMD_NAV_TAKEOFF via COMMAND_LONG with AMSL target altitude
-                try:
-                    self._mav.mav.command_long_send(
-                        self._sysid, self._compid,
-                        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                        0,
-                        0, 0, 0, float('nan'), float('nan'), float('nan'), float(target_amsl)
-                    )
-                except Exception:
-                    pass
-                self._mutex.unlock()
-
-                msg = f"TAKEOFF COMMAND SENT — TARGET ALT: {altitude:.1f} m"
-                self.command_ack_signal.emit(msg)
-                app_state.set_command_feedback(msg)
-            except Exception as e:
-                self._mutex.unlock()
-                self.command_ack_signal.emit(f"TAKEOFF ERROR: {e}")
-
-        import threading
         threading.Thread(target=_do_takeoff, daemon=True).start()
 
     def land(self):
@@ -536,27 +516,16 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             return
         try:
-            self._mutex.lock()
-            # PX4 AUTO_LAND mode: (4, 6) = 100925440
-            try:
-                self._mav.mav.set_mode_send(
-                    self._sysid,
-                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                    100925440
-                )
-            except Exception:
-                pass
+            self._px4_set_mode(4, 6)  # PX4 AUTO_LAND
             self._mav.mav.command_long_send(
                 self._sysid, self._compid,
                 mavutil.mavlink.MAV_CMD_NAV_LAND,
                 0, 0, 0, 0, 0, float('nan'), float('nan'), 0.0
             )
-            self._mutex.unlock()
             msg = "LAND COMMAND SENT"
             self.command_ack_signal.emit(msg)
             app_state.set_command_feedback(msg)
         except Exception as e:
-            self._mutex.unlock()
             self.command_ack_signal.emit(f"LAND ERROR: {e}")
 
     def rtl(self):
@@ -568,27 +537,16 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             return
         try:
-            self._mutex.lock()
-            # PX4 AUTO_RTL mode: (4, 5) = 84148224
-            try:
-                self._mav.mav.set_mode_send(
-                    self._sysid,
-                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                    84148224
-                )
-            except Exception:
-                pass
+            self._px4_set_mode(4, 5)  # PX4 AUTO_RTL
             self._mav.mav.command_long_send(
                 self._sysid, self._compid,
                 mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
                 0, 0, 0, 0, 0, 0, 0, 0
             )
-            self._mutex.unlock()
             msg = "RTL COMMAND SENT"
             self.command_ack_signal.emit(msg)
             app_state.set_command_feedback(msg)
         except Exception as e:
-            self._mutex.unlock()
             self.command_ack_signal.emit(f"RTL ERROR: {e}")
 
     def hold(self):
@@ -600,19 +558,11 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             return
         try:
-            self._mutex.lock()
-            # PX4 AUTO_LOITER mode: (4, 3) = 50593792
-            self._mav.mav.set_mode_send(
-                self._sysid,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                50593792
-            )
-            self._mutex.unlock()
+            self._px4_set_mode(4, 3)  # PX4 AUTO_LOITER
             msg = "HOLD / LOITER COMMAND SENT"
             self.command_ack_signal.emit(msg)
             app_state.set_command_feedback(msg)
         except Exception as e:
-            self._mutex.unlock()
             self.command_ack_signal.emit(f"HOLD ERROR: {e}")
 
     def posctl(self):
@@ -624,19 +574,11 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             return
         try:
-            self._mutex.lock()
-            # PX4 POSCTL mode: (3, 0) = 196608
-            self._mav.mav.set_mode_send(
-                self._sysid,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                196608
-            )
-            self._mutex.unlock()
+            self._px4_set_mode(3, 0)  # PX4 POSCTL
             msg = "POSCTL MODE ACTIVATED"
             self.command_ack_signal.emit(msg)
             app_state.set_command_feedback(msg)
         except Exception as e:
-            self._mutex.unlock()
             self.command_ack_signal.emit(f"POSCTL ERROR: {e}")
 
     def altctl(self):
@@ -648,19 +590,11 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             return
         try:
-            self._mutex.lock()
-            # PX4 ALTCTL mode: (2, 0) = 131072
-            self._mav.mav.set_mode_send(
-                self._sysid,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                131072
-            )
-            self._mutex.unlock()
+            self._px4_set_mode(2, 0)  # PX4 ALTCTL
             msg = "ALTCTL MODE ACTIVATED"
             self.command_ack_signal.emit(msg)
             app_state.set_command_feedback(msg)
         except Exception as e:
-            self._mutex.unlock()
             self.command_ack_signal.emit(f"ALTCTL ERROR: {e}")
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -668,29 +602,29 @@ class QMavsdkWorker(QThread):
     # ──────────────────────────────────────────────────────────────────────────
     def set_manual_control(self, x: int = 0, y: int = 0, z: int = 500, r: int = 0, active: bool = True):
         """Update stick inputs for 10Hz manual remote flight.
-        
+
         x: pitch (-1000..1000, forward/back)
         y: roll (-1000..1000, right/left)
         z: throttle (0..1000, 500=hover)
         r: yaw (-1000..1000, clockwise/counter-clockwise)
         """
-        self._mutex.lock()
-        self._manual_x = int(max(-1000, min(1000, x)))
-        self._manual_y = int(max(-1000, min(1000, y)))
-        self._manual_z = int(max(0, min(1000, z)))
-        self._manual_r = int(max(-1000, min(1000, r)))
-        self._manual_active = active
-        self._mutex.unlock()
+        if self._mutex.tryLock(20):
+            self._manual_x = int(max(-1000, min(1000, x)))
+            self._manual_y = int(max(-1000, min(1000, y)))
+            self._manual_z = int(max(0, min(1000, z)))
+            self._manual_r = int(max(-1000, min(1000, r)))
+            self._manual_active = active
+            self._mutex.unlock()
 
     def stop_manual_control(self):
         """Immediately reset manual sticks to neutral hover."""
-        self._mutex.lock()
-        self._manual_x = 0
-        self._manual_y = 0
-        self._manual_z = 500
-        self._manual_r = 0
-        self._manual_active = False
-        self._mutex.unlock()
+        if self._mutex.tryLock(20):
+            self._manual_x = 0
+            self._manual_y = 0
+            self._manual_z = 500
+            self._manual_r = 0
+            self._manual_active = False
+            self._mutex.unlock()
         if not self._mock_mode and self._mav is not None:
             try:
                 self._mav.mav.manual_control_send(self._sysid, 0, 0, 500, 0, 0)
@@ -719,7 +653,6 @@ class QMavsdkWorker(QThread):
             dr = speed
 
         self.set_manual_control(dx, dy, dz, dr, active=True)
-        import threading
         def _reset_after():
             time.sleep(duration_sec)
             self.stop_manual_control()
@@ -752,20 +685,20 @@ class QMavsdkWorker(QThread):
             self.command_ack_signal.emit("UPLOAD FAILED: NO CONNECTION")
             return
 
+        # Run upload on dedicated thread — NO mutex held during blocking recv_match calls
         def _do_upload():
             try:
-                self._mutex.lock()
-                target_sys = self._sysid
-                target_comp = self._compid
-
-                self._mav.mav.mission_clear_all_send(target_sys, target_comp)
-                time.sleep(0.1)
-
+                ts, tc = self._sysid, self._compid
+                self._mav.mav.mission_clear_all_send(ts, tc)
+                time.sleep(0.15)
                 count = len(waypoints)
-                self._mav.mav.mission_count_send(target_sys, target_comp, count)
+                self._mav.mav.mission_count_send(ts, tc, count)
 
                 for _ in range(count):
-                    req = self._mav.recv_match(type=['MISSION_REQUEST', 'MISSION_REQUEST_INT'], blocking=True, timeout=5.0)
+                    req = self._mav.recv_match(
+                        type=['MISSION_REQUEST', 'MISSION_REQUEST_INT'],
+                        blocking=True, timeout=5.0
+                    )
                     if req is None:
                         raise TimeoutError("Timeout waiting for MISSION_REQUEST from vehicle")
                     seq = req.seq
@@ -779,49 +712,39 @@ class QMavsdkWorker(QThread):
                     lat = float(wp.lat if hasattr(wp, "lat") else wp.get("lat", 0.0) or 0.0)
                     lon = float(wp.lon if hasattr(wp, "lon") else wp.get("lon", 0.0) or 0.0)
                     alt = float(wp.alt if hasattr(wp, "alt") else wp.get("alt", 25.0) or 25.0)
-
-                    is_current = 1 if seq == 0 else 0
-                    autocontinue = 1
+                    is_cur = 1 if seq == 0 else 0
 
                     if req.get_type() == 'MISSION_REQUEST_INT':
                         self._mav.mav.mission_item_int_send(
-                            target_sys, target_comp,
-                            seq, frame, cmd, is_current, autocontinue, p1, p2, p3, p4,
+                            ts, tc, seq, frame, cmd, is_cur, 1, p1, p2, p3, p4,
                             int(lat * 1e7), int(lon * 1e7), float(alt)
                         )
                     else:
                         self._mav.mav.mission_item_send(
-                            target_sys, target_comp,
-                            seq, frame, cmd, is_current, autocontinue, p1, p2, p3, p4,
+                            ts, tc, seq, frame, cmd, is_cur, 1, p1, p2, p3, p4,
                             float(lat), float(lon), float(alt)
                         )
 
                 ack = self._mav.recv_match(type='MISSION_ACK', blocking=True, timeout=5.0)
                 if ack and getattr(ack, 'type', None) == mavutil.mavlink.MAV_MISSION_ACCEPTED:
                     try:
-                        self._mav.mav.mission_set_current_send(target_sys, target_comp, 0)
+                        self._mav.mav.mission_set_current_send(ts, tc, 0)
                     except Exception:
                         pass
-
-                self._mutex.unlock()
-                if ack and getattr(ack, 'type', None) == mavutil.mavlink.MAV_MISSION_ACCEPTED:
                     success_msg = f"MISSION UPLOAD: SUCCESS ({count} WPs)"
                     self.mission_ack_signal.emit(success_msg)
                     self.command_ack_signal.emit(success_msg)
                     app_state.set_mission_status("UPLOADED")
                     app_state.set_command_feedback(success_msg)
                 else:
-                    ack_type = getattr(ack, 'type', 'timeout')
-                    err_msg = f"MISSION UPLOAD REJECTED (ACK type={ack_type})"
+                    err_msg = f"MISSION UPLOAD REJECTED (ACK={getattr(ack, 'type', 'timeout')})"
                     self.command_ack_signal.emit(err_msg)
                     app_state.set_command_feedback(err_msg)
             except Exception as e:
-                self._mutex.unlock()
-                err_msg = f"MISSION UPLOAD ERROR: {str(e)}"
+                err_msg = f"MISSION UPLOAD ERROR: {e}"
                 self.command_ack_signal.emit(err_msg)
                 app_state.set_command_feedback(err_msg)
 
-        import threading
         threading.Thread(target=_do_upload, daemon=True).start()
 
     def start_mission(self):
@@ -834,29 +757,19 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             return
         try:
-            # 1. Arm
             self.arm()
-            time.sleep(0.1)
-            self._mutex.lock()
-            # 2. Switch to PX4 AUTO_MISSION mode: (4, 4) = 67371008
-            self._mav.mav.set_mode_send(
-                self._sysid,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                67371008
-            )
-            # 3. Send MAV_CMD_MISSION_START
+            time.sleep(0.2)
+            self._px4_set_mode(4, 4)  # PX4 AUTO_MISSION
             self._mav.mav.command_long_send(
                 self._sysid, self._compid,
                 mavutil.mavlink.MAV_CMD_MISSION_START,
                 0, 0, 0, 0, 0, 0, 0, 0
             )
-            self._mutex.unlock()
             msg = "MISSION STARTED"
             self.command_ack_signal.emit(msg)
             app_state.set_mission_status("RUNNING")
             app_state.set_command_feedback(msg)
         except Exception as e:
-            self._mutex.unlock()
             self.command_ack_signal.emit(f"START MISSION ERROR: {e}")
 
     def pause_mission(self):
@@ -873,15 +786,12 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             return
         try:
-            self._mutex.lock()
             self._mav.mav.mission_clear_all_send(self._sysid, self._compid)
-            self._mutex.unlock()
             msg = "MISSION CLEARED"
             self.command_ack_signal.emit(msg)
             app_state.set_mission_status("IDLE")
             app_state.set_command_feedback(msg)
         except Exception as e:
-            self._mutex.unlock()
             self.command_ack_signal.emit(f"CLEAR ERROR: {e}")
 
     def download_mission(self):
@@ -907,10 +817,11 @@ class QMavsdkWorker(QThread):
             self.command_ack_signal.emit("DOWNLOAD FAILED: NO CONNECTION")
             return
 
+        # Run download on dedicated thread — NO mutex held during blocking recv_match calls
         def _do_download():
             try:
-                self._mutex.lock()
-                self._mav.mav.mission_request_list_send(self._sysid, self._compid)
+                ts, tc = self._sysid, self._compid
+                self._mav.mav.mission_request_list_send(ts, tc)
                 msg_count = self._mav.recv_match(type=['MISSION_COUNT'], blocking=True, timeout=3.0)
                 if msg_count is None:
                     raise TimeoutError("Timeout waiting for MISSION_COUNT")
@@ -918,31 +829,25 @@ class QMavsdkWorker(QThread):
                 count = msg_count.count
                 downloaded_wps = []
                 for seq in range(count):
-                    self._mav.mav.mission_request_int_send(self._sysid, self._compid, seq)
-                    item = self._mav.recv_match(type=['MISSION_ITEM_INT', 'MISSION_ITEM'], blocking=True, timeout=3.0)
+                    self._mav.mav.mission_request_int_send(ts, tc, seq)
+                    item = self._mav.recv_match(
+                        type=['MISSION_ITEM_INT', 'MISSION_ITEM'], blocking=True, timeout=3.0
+                    )
                     if item is None:
                         raise TimeoutError(f"Timeout waiting for WP #{seq}")
                     lat = item.x / 1e7 if item.get_type() == 'MISSION_ITEM_INT' else item.x
                     lon = item.y / 1e7 if item.get_type() == 'MISSION_ITEM_INT' else item.y
-                    wp = {
+                    downloaded_wps.append({
                         "seq": seq + 1,
-                        "command": item.command,
-                        "frame": item.frame,
-                        "lat": lat,
-                        "lon": lon,
-                        "alt": item.z,
-                        "param1": item.param1,
-                        "param2": item.param2,
-                        "param3": item.param3,
-                        "param4": item.param4,
+                        "command": item.command, "frame": item.frame,
+                        "lat": lat, "lon": lon, "alt": item.z,
+                        "param1": item.param1, "param2": item.param2,
+                        "param3": item.param3, "param4": item.param4,
                         "autocontinue": bool(item.autocontinue),
-                        "is_current": bool(item.current)
-                    }
-                    downloaded_wps.append(wp)
+                        "is_current": bool(item.current),
+                    })
 
-                self._mav.mav.mission_ack_send(self._sysid, self._compid, mavutil.mavlink.MAV_MISSION_ACCEPTED)
-                self._mutex.unlock()
-
+                self._mav.mav.mission_ack_send(ts, tc, mavutil.mavlink.MAV_MISSION_ACCEPTED)
                 self.mission_downloaded_signal.emit(downloaded_wps)
                 app_state.set_mission_waypoints(downloaded_wps)
                 app_state.set_mission_status("LOADED")
@@ -950,10 +855,8 @@ class QMavsdkWorker(QThread):
                 self.command_ack_signal.emit(success_msg)
                 app_state.set_command_feedback(success_msg)
             except Exception as e:
-                self._mutex.unlock()
-                self.command_ack_signal.emit(f"MISSION DOWNLOAD ERROR: {str(e)}")
+                self.command_ack_signal.emit(f"MISSION DOWNLOAD ERROR: {e}")
 
-        import threading
         threading.Thread(target=_do_download, daemon=True).start()
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -973,10 +876,9 @@ class QMavsdkWorker(QThread):
     # ──────────────────────────────────────────────────────────────────────────
     def dispatch_mock(self, mock_result: dict):
         """Apply a mock command result (patches telemetry state & emits feedback)."""
-        self._mutex.lock()
-        patch = mock_result.get("telemetry_patch", {})
-        self._mock_telemetry_state.update(patch)
-        self._mutex.unlock()
+        if self._mutex.tryLock(50):
+            self._mock_telemetry_state.update(mock_result.get("telemetry_patch", {}))
+            self._mutex.unlock()
         feedback = mock_result.get("result", "COMMAND SENT [MOCK]")
         self.command_ack_signal.emit(feedback)
 
@@ -1047,7 +949,10 @@ class QMavsdkWorker(QThread):
             tick += 1
             telemetry = generator.generate_packet(tick)
 
-            self._mutex.lock()
+            if not self._mutex.tryLock(50):
+                self.telemetry_updated.emit(telemetry)
+                self.msleep(100)
+                continue
             mode = self._mock_telemetry_state.get("mode", "")
             if mode in ("AUTO", "GUIDED", "MISSION") and self._mock_mission_waypoints:
                 if self._mock_active_wp_index < len(self._mock_mission_waypoints):
@@ -1107,6 +1012,7 @@ class QMavsdkWorker(QThread):
 
             telemetry.update(self._mock_telemetry_state)
             self._mutex.unlock()
+
             self.telemetry_updated.emit(telemetry)
             self.msleep(100)
 
