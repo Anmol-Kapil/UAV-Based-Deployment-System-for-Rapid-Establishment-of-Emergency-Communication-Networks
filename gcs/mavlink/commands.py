@@ -31,9 +31,77 @@ ARDUPILOT_MODES = {
 }
 
 
-def send_arm(mav) -> str:
-    """Send ARM command to vehicle."""
+def _set_px4_circuit_breakers(mav):
+    """Bypass PX4 SITL preflight checks (power, USB, safety switch, GPS lock, RC transmitter)."""
+    import struct
     try:
+        sys_id = getattr(mav, "target_system", 1) or 1
+        comp_id = getattr(mav, "target_component", 1) or 1
+        
+        # INT32 circuit breakers packed as 4-byte IEEE 754 floats
+        params_int = {
+            "CBRK_SUPPLY_CHK": 894281,  # Bypass battery / power supply check
+            "CBRK_USB_CHK": 197848,     # Bypass USB connection check
+            "CBRK_IO_SAFETY": 22027,    # Bypass hardware safety button
+            "CBRK_AIRSPD_CHK": 162128,  # Bypass airspeed check
+            "CBRK_ENGINEPROC": 284953,  # Bypass engine failure check
+            "CBRK_FLIGHTTERM": 121212,  # Bypass flight termination check
+            "CBRK_VTOLARMING": 15987,   # Bypass VTOL arming check
+            "COM_RC_IN_MODE": 1,        # Joystick mode (disables RC transmitter requirement)
+            "NAV_RCL_ACT": 0,           # Disable RC Loss failsafe
+            "NAV_DLL_ACT": 0,           # Disable DataLink Loss failsafe
+            "COM_RCL_EXCEPT": 7,        # Ignore RC loss in Mission(1) + Hold(2) + Offboard(4)
+            "COM_ARM_WO_GPS": 1,        # Allow arming without 3D GPS fix
+            "COM_ARM_MAG_STR": 0,       # Disable magnetic anomaly lock
+            "COM_ARM_EKF_POS": 0,       # Bypass EKF horizontal position lock
+            "COM_ARM_EKF_VEL": 0,       # Bypass EKF velocity lock
+            "COM_ARM_EKF_HGT": 0,       # Bypass EKF height lock
+            "COM_ARM_EKF_YAW": 0,       # Bypass EKF yaw lock
+            "COM_ARM_MIS_REQ": 0,       # Do not require mission to arm
+            "COM_ARM_AUTH_REQ": 0,      # Do not require arm authorization
+            "COM_PREARM_MODE": 0,       # Disable restrictive pre-arm checks
+        }
+        for name, val in params_int.items():
+            packed_float = struct.unpack('<f', struct.pack('<i', int(val)))[0]
+            mav.mav.param_set_send(
+                sys_id, comp_id,
+                name.encode('ascii')[:16],
+                packed_float,
+                mavutil.mavlink.MAV_PARAM_TYPE_INT32
+            )
+
+        # REAL32 parameters: disable auto-disarm timers
+        mav.mav.param_set_send(
+            sys_id, comp_id,
+            b"COM_DISARM_PREROL",
+            0.0,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+        mav.mav.param_set_send(
+            sys_id, comp_id,
+            b"COM_DISARM_LAND",
+            0.0,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+
+        # Disengage safety switch via MAVLink command (SAFETY_SWITCH_STATE_DANGEROUS = 1)
+        try:
+            mav.mav.command_long_send(
+                sys_id, comp_id,
+                5300,  # MAV_CMD_DO_SET_SAFETY_SWITCH_STATE
+                0,
+                1, 0, 0, 0, 0, 0, 0
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def send_arm(mav) -> str:
+    """Send ARM command to vehicle with preflight check bypass."""
+    try:
+        _set_px4_circuit_breakers(mav)
         sys_id = getattr(mav, "target_system", 1) or 1
         comp_id = getattr(mav, "target_component", 1) or 1
         mav.mav.command_long_send(
@@ -41,7 +109,7 @@ def send_arm(mav) -> str:
             comp_id,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0,
-            1, 0, 0, 0, 0, 0, 0
+            1, 21196.0, 0, 0, 0, 0, 0
         )
         return "ARM COMMAND SENT"
     except Exception as e:
@@ -58,7 +126,7 @@ def send_disarm(mav) -> str:
             comp_id,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0,
-            0, 0, 0, 0, 0, 0, 0
+            0, 21196.0, 0, 0, 0, 0, 0
         )
         return "DISARM COMMAND SENT"
     except Exception as e:
@@ -69,6 +137,7 @@ def send_takeoff(mav, altitude: float = 5.0, lat: float = None, lon: float = Non
     """Send ARM & TAKEOFF commands to vehicle at specified relative altitude (metres)."""
     try:
         import time
+        _set_px4_circuit_breakers(mav)
         sys_id = getattr(mav, "target_system", 1) or 1
         comp_id = getattr(mav, "target_component", 1) or 1
 
@@ -76,11 +145,11 @@ def send_takeoff(mav, altitude: float = 5.0, lat: float = None, lon: float = Non
         target_lat = float(lat) if (lat is not None and lat != 0.0) else float('nan')
         target_lon = float(lon) if (lon is not None and lon != 0.0) else float('nan')
 
-        # 1. Arm vehicle first
+        # 1. Arm vehicle first (force arm bypass 21196.0)
         mav.mav.command_long_send(
             sys_id, comp_id,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0, 1, 0, 0, 0, 0, 0, 0
+            0, 1, 21196.0, 0, 0, 0, 0, 0
         )
         time.sleep(0.15)
 

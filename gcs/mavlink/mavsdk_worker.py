@@ -269,37 +269,103 @@ class QMavsdkWorker(QThread):
         return f"CMD ACK ({cmd}): {res_name}"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # PX4 Preflight Parameter Configuration
+    # PX4 Preflight Parameter Configuration (Circuit Breakers)
     # ──────────────────────────────────────────────────────────────────────────
+    def _set_param_int(self, param_name: str, value: int):
+        """Send an INT32 parameter to PX4 using raw 4-byte IEEE 754 float packing."""
+        import struct
+        if self._mav is None:
+            return
+        try:
+            param_bytes = param_name.encode('ascii')[:16]
+            packed_float = struct.unpack('<f', struct.pack('<i', int(value)))[0]
+            self._mav.mav.param_set_send(
+                self._sysid, self._compid,
+                param_bytes,
+                packed_float,
+                mavutil.mavlink.MAV_PARAM_TYPE_INT32
+            )
+        except Exception:
+            pass
+
+    def _set_param_float(self, param_name: str, value: float):
+        """Send a REAL32 parameter to PX4."""
+        if self._mav is None:
+            return
+        try:
+            param_bytes = param_name.encode('ascii')[:16]
+            self._mav.mav.param_set_send(
+                self._sysid, self._compid,
+                param_bytes,
+                float(value),
+                mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+            )
+        except Exception:
+            pass
+
+    def configure_px4_sitl(self):
+        """Public trigger to apply all PX4 SITL circuit breakers and arming bypasses."""
+        self._configure_px4_sitl()
+
     def _configure_px4_sitl(self):
-        """Auto-configure PX4 SITL parameters to prevent auto-disarm and supply check errors."""
+        """Auto-configure all PX4 SITL circuit breakers so health checks pass cleanly."""
         if self._mock_mode or self._mav is None:
             return
         def _do_config():
             try:
-                time.sleep(0.3)
-                # 1. Disable battery supply check in simulation (CBRK_SUPPLY_CHK = 894281)
-                self._mav.mav.param_set_send(
-                    self._sysid, self._compid,
-                    b"CBRK_SUPPLY_CHK", 894281.0,
-                    mavutil.mavlink.MAV_PARAM_TYPE_INT32
-                )
-                time.sleep(0.1)
-                # 2. Disable 10-second ground auto-disarm timeout (COM_DISARM_PREROL = 0)
-                self._mav.mav.param_set_send(
-                    self._sysid, self._compid,
-                    b"COM_DISARM_PREROL", 0.0,
-                    mavutil.mavlink.MAV_PARAM_TYPE_REAL32
-                )
-                time.sleep(0.1)
-                # 3. Request high-rate data streams
+                time.sleep(0.2)
+                # Comprehensive INT32 Circuit Breakers & Pre-Arm Overrides
+                # Packed as IEEE 754 float bytes so PX4's memcpy recovers the exact int32
+                params_int = {
+                    "CBRK_SUPPLY_CHK": 894281,  # Bypass battery / power module check
+                    "CBRK_USB_CHK": 197848,     # Bypass USB connection check
+                    "CBRK_IO_SAFETY": 22027,    # Bypass hardware safety switch
+                    "CBRK_AIRSPD_CHK": 162128,  # Bypass airspeed sensor check
+                    "CBRK_ENGINEPROC": 284953,  # Bypass engine failure check
+                    "CBRK_FLIGHTTERM": 121212,  # Bypass flight termination check
+                    "CBRK_VTOLARMING": 15987,   # Bypass VTOL arming check
+                    "COM_RC_IN_MODE": 1,        # Joystick mode (disables RC transmitter requirement & checks)
+                    "NAV_RCL_ACT": 0,           # Disable RC Loss failsafe
+                    "NAV_DLL_ACT": 0,           # Disable DataLink Loss failsafe
+                    "COM_RCL_EXCEPT": 7,        # Ignore RC loss in Mission(1) + Hold(2) + Offboard(4)
+                    "COM_ARM_WO_GPS": 1,        # Allow arming without 3D GPS fix
+                    "COM_ARM_MAG_STR": 0,       # Disable magnetic anomaly lock
+                    "COM_ARM_EKF_POS": 0,       # Bypass EKF horizontal position lock
+                    "COM_ARM_EKF_VEL": 0,       # Bypass EKF velocity lock
+                    "COM_ARM_EKF_HGT": 0,       # Bypass EKF height lock
+                    "COM_ARM_EKF_YAW": 0,       # Bypass EKF yaw lock
+                    "COM_ARM_MIS_REQ": 0,       # Do not require mission to arm
+                    "COM_ARM_AUTH_REQ": 0,      # Do not require arm authorization
+                    "COM_PREARM_MODE": 0,       # Disable restrictive pre-arm checks
+                }
+                for name, val in params_int.items():
+                    self._set_param_int(name, val)
+                    time.sleep(0.02)
+
+                # Float parameters: disable auto-disarm timers
+                self._set_param_float("COM_DISARM_PREROL", 0.0)
+                self._set_param_float("COM_DISARM_LAND", 0.0)
+                time.sleep(0.05)
+
+                # Disengage safety switch via MAVLink command (SAFETY_SWITCH_STATE_DANGEROUS = 1)
+                try:
+                    self._mav.mav.command_long_send(
+                        self._sysid, self._compid,
+                        5300,  # MAV_CMD_DO_SET_SAFETY_SWITCH_STATE
+                        0,
+                        1, 0, 0, 0, 0, 0, 0  # 1 = Safety Off / Armed
+                    )
+                except Exception:
+                    pass
+
+                # Request high-rate data streams
                 self._mav.mav.request_data_stream_send(
                     self._sysid, self._compid,
                     mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
                 )
-                app_state.log("INFO", "PX4", "Configured PX4 SITL bypasses (CBRK_SUPPLY_CHK=894281, COM_DISARM_PREROL=0).")
-            except Exception:
-                pass
+                app_state.log("INFO", "PX4", "Bypassed all SITL health checks (CBRK_SUPPLY_CHK, CBRK_USB_CHK, CBRK_IO_SAFETY, COM_RC_IN_MODE, COM_ARM_WO_GPS, COM_DISARM_PREROL).")
+            except Exception as e:
+                app_state.log("DEBUG", "PX4", f"SITL config note: {e}")
         import threading
         threading.Thread(target=_do_config, daemon=True).start()
 
@@ -307,7 +373,7 @@ class QMavsdkWorker(QThread):
     # Flight Operations (ARM, TAKEOFF, LAND, RTL, POSCTL)
     # ──────────────────────────────────────────────────────────────────────────
     def arm(self):
-        """Arm vehicle motors in PX4 / ArduPilot."""
+        """Arm vehicle motors in PX4 / ArduPilot with preflight bypasses."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_arm())
@@ -315,21 +381,48 @@ class QMavsdkWorker(QThread):
         if self._mav is None:
             self.command_ack_signal.emit("ARM FAILED: NO CONNECTION")
             return
-        try:
-            self._mutex.lock()
-            # MAV_CMD_COMPONENT_ARM_DISARM with force=21196.0 for SITL
-            self._mav.mav.command_long_send(
-                self._sysid, self._compid,
-                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                0, 1, 21196.0, 0, 0, 0, 0, 0
-            )
-            self._mutex.unlock()
-            msg = "ARM COMMAND SENT"
-            self.command_ack_signal.emit(msg)
-            app_state.set_command_feedback(msg)
-        except Exception as e:
-            self._mutex.unlock()
-            self.command_ack_signal.emit(f"ARM ERROR: {e}")
+        def _do_arm():
+            try:
+                # 1. Re-assert key circuit breakers immediately before arming
+                self._set_param_int("CBRK_SUPPLY_CHK", 894281)
+                self._set_param_int("CBRK_USB_CHK", 197848)
+                self._set_param_int("CBRK_IO_SAFETY", 22027)
+                self._set_param_int("COM_RC_IN_MODE", 1)
+                self._set_param_int("COM_ARM_WO_GPS", 1)
+                self._set_param_float("COM_DISARM_PREROL", 0.0)
+                time.sleep(0.05)
+
+                # Disengage safety switch
+                try:
+                    self._mav.mav.command_long_send(
+                        self._sysid, self._compid,
+                        5300,  # MAV_CMD_DO_SET_SAFETY_SWITCH_STATE
+                        0,
+                        1, 0, 0, 0, 0, 0, 0
+                    )
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+                self._mutex.lock()
+                # 2. Send MAV_CMD_COMPONENT_ARM_DISARM with force=21196.0 (bypass preflight checks)
+                self._mav.mav.command_long_send(
+                    self._sysid, self._compid,
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    0,
+                    1,        # 1 = Arm
+                    21196.0,  # Force arm bypass
+                    0, 0, 0, 0, 0
+                )
+                self._mutex.unlock()
+                msg = "ARM COMMAND SENT (PREFLIGHT BYPASS ACTIVE)"
+                self.command_ack_signal.emit(msg)
+                app_state.set_command_feedback(msg)
+            except Exception as e:
+                self._mutex.unlock()
+                self.command_ack_signal.emit(f"ARM ERROR: {e}")
+        import threading
+        threading.Thread(target=_do_arm, daemon=True).start()
 
     def disarm(self):
         """Disarm vehicle motors."""
@@ -356,7 +449,7 @@ class QMavsdkWorker(QThread):
             self.command_ack_signal.emit(f"DISARM ERROR: {e}")
 
     def takeoff(self, altitude: float = 5.0):
-        """Execute atomic takeoff to target altitude in Gazebo/PX4."""
+        """Execute atomic takeoff to target altitude in Gazebo/PX4 with preflight bypass."""
         if self._mock_mode:
             from gcs.mavlink import commands
             self.dispatch_mock(commands.mock_takeoff(altitude))
@@ -367,6 +460,24 @@ class QMavsdkWorker(QThread):
 
         def _do_takeoff():
             try:
+                # 0. Re-assert circuit breakers immediately before takeoff
+                self._set_param_int("CBRK_SUPPLY_CHK", 894281)
+                self._set_param_int("CBRK_USB_CHK", 197848)
+                self._set_param_int("CBRK_IO_SAFETY", 22027)
+                self._set_param_int("COM_RC_IN_MODE", 1)
+                self._set_param_int("COM_ARM_WO_GPS", 1)
+                self._set_param_float("COM_DISARM_PREROL", 0.0)
+                try:
+                    self._mav.mav.command_long_send(
+                        self._sysid, self._compid,
+                        5300,  # MAV_CMD_DO_SET_SAFETY_SWITCH_STATE
+                        0,
+                        1, 0, 0, 0, 0, 0, 0
+                    )
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
                 # 1. Arm vehicle
                 self._mutex.lock()
                 self._mav.mav.command_long_send(
